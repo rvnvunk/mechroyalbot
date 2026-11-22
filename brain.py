@@ -46,7 +46,7 @@ STRAFE_HI = float(os.environ.get("STRAFE_HI", "0.95"))
 RANGE_MIN = float(os.environ.get("RANGE_MIN", "0"))
 # experiment knobs (defaults = submitted behaviour)
 HUNT_WHEN_HOSTILE = os.environ.get("HUNT_WHEN_HOSTILE", "1") == "1"
-TRAVEL_BOOST = os.environ.get("TRAVEL_BOOST", "0") == "1"
+TRAVEL_BOOST = os.environ.get("TRAVEL_BOOST", "1") == "1"
 HUNT_HI = float(os.environ.get("HUNT_HI", "30"))
 UPG_STYLE = os.environ.get("UPG_STYLE", "ehp")
 FLANK = os.environ.get("FLANK", "1") == "1"
@@ -65,10 +65,12 @@ AGGRO = int(os.environ.get("AGGRO", "0"))
 AGGRO_QUIET = float(os.environ.get("AGGRO_QUIET", "6"))
 RET2 = int(os.environ.get("RET2", "0"))
 REGEN_MULT = float(os.environ.get("REGEN_MULT", "1.0"))
-UPG_DMG_W = float(os.environ.get("UPG_DMG_W", "1.0"))
+UPG_DMG_W = float(os.environ.get("UPG_DMG_W", "2.5"))
 PREY_AWAY = float(os.environ.get("PREY_AWAY", "0"))
 HUNT_D_MIN = float(os.environ.get("HUNT_D_MIN", "0"))
-CUBE_URG = float(os.environ.get("CUBE_URG", "90"))
+CUBE_URG = float(os.environ.get("CUBE_URG", "60"))
+PICK_URG = float(os.environ.get("PICK_URG", "120"))
+CUBE_PRIO = float(os.environ.get("CUBE_PRIO", "0.25"))
 PEEK_R = float(os.environ.get("PEEK_R", "14"))
 TEMPO_HP = float(os.environ.get("TEMPO_HP", "0.85"))
 TEMPO_QUIET = float(os.environ.get("TEMPO_QUIET", "8"))
@@ -730,6 +732,10 @@ class Brain:
             if self.mode == "ffa" and not tr.hostile and not (tr.hp < 0.5 * tr.max_hp or self._distracted(tr)):
                 value -= 0.6
             score = value / max(t_tot, 0.5)
+            if CUBE_PRIO > 0 and not tr.hostile and self.mode != "ffa":
+                # cube-rich passives are the strong tiers the squad releases last, and they drop
+                # their cubes (+2) when they die: every cube is +4% damage and HP for us
+                score *= 1.0 + CUBE_PRIO * min(tr.cubes, 10)
             if PREY_AWAY > 0 and not tr.hostile and self.mode != "ffa":
                 # a passive next to the hunters drags us into their crossfire
                 hn = [o for o in threats if o["hostile"] and o["age"] < 12.0]
@@ -941,7 +947,7 @@ class Brain:
                 urgent_loot = ((self.loot_kind == "drop" and gd < 80) or (self.loot_kind == "pick" and gd < 45)
                                or (self.loot_kind == "cube" and gd < 18) or target is None)
             else:
-                urgent_loot = (self.loot_kind == "drop" or (self.loot_kind == "pick" and gd < 120)
+                urgent_loot = (self.loot_kind == "drop" or (self.loot_kind == "pick" and gd < PICK_URG)
                                or (self.loot_kind == "cube" and gd < (CUBE_URG if self.my_cubes < 10 else 35))
                                or target is None or target["hostile"] or ffa)
             if urgent_loot:
@@ -977,6 +983,8 @@ class Brain:
         for e in threats:
             if not e["hostile"] and e["age"] < 20 and self.zone_ok(e["pos"], e["d"] / 11.0, 10.0):
                 pd = e["d"]
+                if CUBE_PRIO > 0:
+                    pd /= 1.0 + CUBE_PRIO * min(e["tr"].cubes, 10)
                 if hn:
                     near_h = min(d2(o["pos"], e["pos"]) for o in hn)
                     pd += PREY_AWAY * max(0.0, 140.0 - near_h)
