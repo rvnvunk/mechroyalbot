@@ -40,7 +40,7 @@ WVAL = {"laser": 1.7, "lightning": float(os.environ.get("W_LIGHT", "0.9")), "gun
 CUBE_VAL = float(os.environ.get("CUBE_VAL", "13"))
 HOSTILE_BONUS = float(os.environ.get("HOSTILE_BONUS", "5"))
 KITE = os.environ.get("KITE", "0") == "1"
-FIGHT_BOOST = os.environ.get("FIGHT_BOOST", "0") == "1"
+FIGHT_BOOST = os.environ.get("FIGHT_BOOST", "1") == "1"
 STRAFE_LO = float(os.environ.get("STRAFE_LO", "0.35"))
 STRAFE_HI = float(os.environ.get("STRAFE_HI", "0.95"))
 RANGE_MIN = float(os.environ.get("RANGE_MIN", "0"))
@@ -54,6 +54,14 @@ NPC_FIRST = os.environ.get("NPC_FIRST", "0") == "1"
 FARM_EARLY = float(os.environ.get("FARM_EARLY", "0"))
 ISO = os.environ.get("ISO", "1") == "1"
 FIGHT_RANGE_SCALE = float(os.environ.get("FIGHT_RANGE_SCALE", "1.0"))
+TEMPO = int(os.environ.get("TEMPO", "0"))
+PEEK = int(os.environ.get("PEEK", "1"))
+BLITZ = int(os.environ.get("BLITZ", "0"))
+PF_W = float(os.environ.get("PF_W", "1.0"))
+PEEK_R = float(os.environ.get("PEEK_R", "14"))
+TEMPO_HP = float(os.environ.get("TEMPO_HP", "0.85"))
+TEMPO_QUIET = float(os.environ.get("TEMPO_QUIET", "8"))
+TEMPO_UNLOCK = float(os.environ.get("TEMPO_UNLOCK", "9999"))
 
 
 def angn(a):
@@ -185,6 +193,10 @@ class Brain:
         self.iso_spot = None
         self.iso_t = -99.0
         self.iso_for = None
+        self.pk_cache = (None, None)
+        self.pk_t = -99.0
+        self.pk_for = None
+        self.pk_state = "expose"
         self.range_d = 90.0
         self.range_t = -99.0
         self.range_for = None
@@ -638,6 +650,19 @@ class Brain:
         losing = tr.hp < tr.max_hp * 0.9
         return looking_away and (losing or tr.charging)
 
+    def _prey_ok(self):
+        """May we start on a passive (non-hunting) mech right now?"""
+        if self.mode == "ffa" or TEMPO == 0 or self.t >= TEMPO_UNLOCK:
+            return True
+        if TEMPO == 1:
+            return False
+        if self.hp < TEMPO_HP * self.max_hp:
+            return False
+        for tr in self.tracks.values():
+            if tr.hostile and self.t - tr.t_seen < TEMPO_QUIET:
+                return False
+        return True
+
     def _pick_target(self, threats):
         """Choose the target with the best net kill rate.
 
@@ -652,10 +677,14 @@ class Brain:
         hostiles = [e for e in threats if e["hostile"] and e["age"] < 3.0 and (e["los"] or e["d"] < 60)]
         inc = sum(e["dps"] for e in hostiles)
         walk = self.stats.get("walk_speed", 11.7)
+        prey_ok = self._prey_ok()
+        cur = self.last_target_id
         for e in threats:
             if e["age"] > 1.0:
                 continue
             tr = e["tr"]
+            if not tr.hostile and not prey_ok and tr.id != cur:
+                continue
             d = e["d"]
             c = (e["pos"][0], e["pos"][1], e["pos"][2] + 4.5 * e["scale"])
             los = self.los(my_m, c) if self.world else True
@@ -679,6 +708,10 @@ class Brain:
             if self.mode == "ffa" and not tr.hostile and not (tr.hp < 0.5 * tr.max_hp or self._distracted(tr)):
                 value -= 0.6
             score = value / max(t_tot, 0.5)
+            if tr.hostile and self.mode != "ffa" and PF_W != 1.0:
+                # practice squad releases hunters weakest first: a dead hunter is replaced by a stronger one,
+                # a dead passive removes a strong mech from the pool
+                score *= PF_W
             if tr.id == self.last_target_id:
                 score *= 1.15   # switching costs aim time
             if best is None or score > best[0]:
@@ -860,9 +893,13 @@ class Brain:
         g = self._loot_goal(near, urg)
         if g is not None and self.loot_kind in ("pick", "cube", "drop"):
             gd = d2(g, pos)
-            urgent_loot = (self.loot_kind == "drop" or (self.loot_kind == "pick" and gd < 120)
-                           or (self.loot_kind == "cube" and gd < 35)
-                           or target is None or target["hostile"] or ffa)
+            if BLITZ and not ffa:
+                urgent_loot = ((self.loot_kind == "drop" and gd < 80) or (self.loot_kind == "pick" and gd < 45)
+                               or (self.loot_kind == "cube" and gd < 18) or target is None)
+            else:
+                urgent_loot = (self.loot_kind == "drop" or (self.loot_kind == "pick" and gd < 120)
+                               or (self.loot_kind == "cube" and gd < 35)
+                               or target is None or target["hostile"] or ffa)
             if urgent_loot:
                 self.intent = "LOOT"
                 return g, "fast"
@@ -897,7 +934,7 @@ class Brain:
                     prey = e
         held = self._held()
         armed = ("laser" in held or "lightning" in held or self.my_cubes >= 4)
-        if ffa:
+        if ffa or not self._prey_ok():
             prey = None
         if prey is not None and armed and prey["d"] < 220 and prey["age"] < 15:
             # points come only from kills: a known victim beats farming crates
@@ -1344,6 +1381,18 @@ class Brain:
             if math.hypot(*mv) < 0.1:
                 return (0.0, 0.0), 0.0
             return unit(mv), 1.0
+        if PEEK and self.world is not None:
+            hs = [e for e in threats if e["hostile"] and e["age"] < 4.0 and e["d"] < 240]
+            if any(e["tr"].id == tr.id for e in hs):
+                expose, hide = self._peek_spots(tr, hs)
+                ready = self._shot_ready(tr, d)
+                goal = expose if ready else hide
+                self.pk_state = "expose" if ready else "hide"
+                if goal is not None:
+                    if d2(goal, pos) > 1.5:
+                        return self._steer_to(goal), 1.0
+                    if not ready:
+                        return (0.0, 0.0), 0.0
         best_d = self._best_range(tr, threats) * FIGHT_RANGE_SCALE
         if RANGE_MIN > 0 and "lightning" not in held and not ("lightning" in their):
             best_d = max(best_d, RANGE_MIN)
@@ -1436,6 +1485,81 @@ class Brain:
             return 30.0
         ok = [dd for dd, v in vals if v >= 0.92 * top]
         return max(ok) if ok else 30.0
+
+    def _shot_ready(self, tr, d):
+        """Is our main weapon ready to deliver a hit now (so exposing ourselves pays)?"""
+        laser = self._weapon("laser")
+        if laser is not None and d < 275:
+            st = laser.get("stats") or {}
+            ch = laser.get("charge") or 0.0
+            if ch >= st.get("charge", 0.75) * 0.9:
+                return True
+            # laser recharging: hide unless the gun alone is clearly winning this exchange
+            gun = self._weapon("gun")
+            if gun is not None and gun.get("reload", 0) <= 0 and gun.get("ammo", 1) > 0 and (self.adv > 1.6 or tr.hp < 320):
+                return True
+            return False
+        lt = self._weapon("lightning")
+        if lt is not None and d < 55 and self.energy > 14:
+            return True
+        gun = self._weapon("gun")
+        if gun is not None and gun.get("reload", 0) <= 0 and gun.get("ammo", 1) > 0 and d < 228:
+            return True
+        return False
+
+    def _peek_spots(self, tr, hs):
+        """Nearby spots: one that shows us to the target only, one hidden from every known hostile."""
+        t = self.t
+        if t - self.pk_t < 0.3 and self.pk_for == tr.id:
+            return self.pk_cache
+        w = self.world
+        pos = self.pos
+        gz0 = w.ground_z(pos[0], pos[1])
+        tlim = min(time.perf_counter() + 0.007, self.deadline)
+        cands = [(pos[0], pos[1])]
+        for r in (4.0, 8.0, 13.0):
+            for k in range(8):
+                a = k * (TAU / 8) + (0.39 if r == 8.0 else 0.0)
+                cands.append((pos[0] + math.cos(a) * r, pos[1] + math.sin(a) * r))
+        for (dd, x, y) in w.anchors_near(pos[0], pos[1], PEEK_R)[:8]:
+            cands.append((x, y))
+        best_e = None
+        best_h = None
+        for (x, y) in cands:
+            if time.perf_counter() > tlim:
+                break
+            if (x, y) != (pos[0], pos[1]):
+                if not w.walkable(x, y) or not w.straight_walkable(pos[0], pos[1], x, y):
+                    continue
+                if not self.zone_ok((x, y), 1.5, 4.0):
+                    continue
+            gz = w.ground_z(x, y)
+            if abs(gz - gz0) > 3.0:
+                continue
+            body = (x, y, gz + 4.5 * self.scale)
+            head = (x, y, gz + 8.0 * self.scale)
+            expo = 0.0
+            seen_t = False
+            for e in hs:
+                sc = e["scale"]
+                ee = (e["pos"][0], e["pos"][1], e["pos"][2] + 8.0 * sc)
+                if w.los(ee[0], ee[1], ee[2], body[0], body[1], body[2]) or w.los(ee[0], ee[1], ee[2], head[0], head[1], head[2]):
+                    if e["tr"].id == tr.id:
+                        seen_t = True
+                    else:
+                        expo += max(e["dps"], 20.0)
+            dist = d2((x, y), pos)
+            if seen_t:
+                sc_e = expo + dist * 0.8
+                if best_e is None or sc_e < best_e[0]:
+                    best_e = (sc_e, [x, y, gz])
+            elif expo <= 0.0:
+                if best_h is None or dist < best_h[0]:
+                    best_h = (dist, [x, y, gz])
+        self.pk_cache = (best_e[1] if best_e else None, best_h[1] if best_h else None)
+        self.pk_t = t
+        self.pk_for = tr.id
+        return self.pk_cache
 
     def _isolation_spot(self, tr, shooters):
         """Nearby walkable spot that keeps the target in view and hides us from the other shooters."""
