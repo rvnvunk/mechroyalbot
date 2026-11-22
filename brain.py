@@ -125,6 +125,8 @@ class Brain:
         self.crates = {}
         self.pickups = {}
         self.cubes_seen = {}
+        self.cube_bad = set()
+        self.cube_near = {}
         self.dead_ids = set()
         self.last_offer = None
         self.my_id = None
@@ -377,8 +379,17 @@ class Brain:
             vis_pick.add(p["id"])
         vis_cubes = set()
         for cu in obs.get("cubes") or []:
+            if cu["id"] in self.cube_bad:
+                continue
             self.cubes_seen[cu["id"]] = (list(cu["pos"]), t)
             vis_cubes.add(cu["id"])
+            # standing right next to it for a while without getting it: unreachable (roof, air)
+            if d2(cu["pos"], self.pos) < 5.0:
+                n = self.cube_near.get(cu["id"], 0) + 1
+                self.cube_near[cu["id"]] = n
+                if n > 25:
+                    self.cube_bad.add(cu["id"])
+                    self.cubes_seen.pop(cu["id"], None)
         # remove remembered things that should be visible now but are not
         for store, vis in ((self.crates, vis_crates), (self.pickups, vis_pick), (self.cubes_seen, vis_cubes)):
             for k in list(store):
