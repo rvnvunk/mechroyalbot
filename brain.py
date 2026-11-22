@@ -26,6 +26,11 @@ TAU = 2.0 * math.pi
 RET_HP = 0.22
 RET_ADV = 0.45
 REGEN_HP = 0.45
+FFA_THRESHOLD = 8.0
+# free-for-all knobs (placement matters, everyone shoots)
+FFA_RET_HP = 0.4
+FFA_RET_ADV = 0.9
+FFA_REGEN_HP = 0.75
 WVAL = {"laser": 1.7, "lightning": 1.5, "gun": 1.0, "mortar": 0.55}
 
 
@@ -127,6 +132,16 @@ class Brain:
         self.cubes_seen = {}
         self.cube_bad = set()
         self.cube_near = {}
+        # practice squad vs free-for-all detection
+        self.mode = "practice"
+        self.ffa_evidence = 0.0
+        self.ffa_log = []
+        self.ffa_kinds = {}
+        self.ffa_seen_proj = set()
+        self.ffa_seen_beam = set()
+        self.hp_seen = {}
+        self.hit_by_us = {}
+        self.n_mechs = 16
         self.dead_ids = set()
         self.last_offer = None
         self.my_id = None
@@ -172,6 +187,7 @@ class Brain:
     # ================================================================ hello
     def on_hello(self, msg):
         self.cfg = msg.get("config") or {}
+        self.n_mechs = cget(self.cfg, "match.mechs", 16)
         self.rng = random.Random(msg.get("seed", 1))
         self.slot = msg.get("slot", 0)
         mp = msg.get("map") or {}
@@ -234,6 +250,7 @@ class Brain:
         act = {}
 
         self._update_memory(obs)
+        self._update_mode(obs)
 
         # ---------------- upgrades
         offer = obs.get("offer")
@@ -349,6 +366,9 @@ class Brain:
                     self.tracks[by] = tr
             elif ty == "hit":
                 self.last_combat_t = t
+                tg = ev.get("target")
+                if tg is not None:
+                    self.hit_by_us[tg] = t
             elif ty == "kill":
                 self.kills += 1
                 tid = ev.get("target")
@@ -404,6 +424,101 @@ class Brain:
                 p = self.npcs[k][0]
                 if d2(p, self.pos) < 35.0 or t - self.npcs[k][3] > 60.0:
                     del self.npcs[k]
+
+    # ================================================================ mode
+    def _update_mode(self, obs):
+        """Practice squad (house bots never fight each other) or free-for-all?"""
+        if self.mode == "ffa":
+            return
+        t = self.t
+        ev = 0.0
+        mechs = [m for m in (obs.get("mechs") or []) if m.get("kind") == "mech" and m.get("id") != self.my_id]
+        npcs = [m for m in (obs.get("mechs") or []) if m.get("kind") == "npc"]
+        # 1. deaths we did not cause
+        dead_others = (self.n_mechs - self.alive) - self.kills
+        if dead_others > getattr(self, "_dead_seen", 0):
+            if t < 200:
+                ev += 2.5 * (dead_others - getattr(self, "_dead_seen", 0))
+            self.ffa_kinds['death'] = self.ffa_kinds.get('death', 0) + 1
+            self._dead_seen = dead_others
+        # 2. bullets flying at another mech
+        for p in obs.get("projectiles") or []:
+            pid = p.get("id")
+            if pid in self.ffa_seen_proj or p.get("kind") not in ("gun", "mortar"):
+                continue
+            pp, pv = p.get("pos"), p.get("vel")
+            if not pp or not pv:
+                continue
+            vv = pv[0] ** 2 + pv[1] ** 2
+            if vv < 1:
+                continue
+            # bullets aimed at us (or passing near us) say nothing about free-for-all
+            rx0, ry0 = self.pos[0] - pp[0], self.pos[1] - pp[1]
+            tc0 = (rx0 * pv[0] + ry0 * pv[1]) / vv
+            if tc0 > -0.05:
+                cx0 = pp[0] + pv[0] * max(tc0, 0.0) - self.pos[0]
+                cy0 = pp[1] + pv[1] * max(tc0, 0.0) - self.pos[1]
+                if cx0 * cx0 + cy0 * cy0 < 15.0 ** 2:
+                    self.ffa_seen_proj.add(pid)
+                    continue
+            for m in mechs:
+                c = m["pos"]
+                rx, ry = c[0] - pp[0], c[1] - pp[1]
+                if rx * rx + ry * ry < 36:
+                    continue
+                tc = (rx * pv[0] + ry * pv[1]) / vv
+                if 0.02 < tc < 0.8:
+                    cx = pp[0] + pv[0] * tc - c[0]
+                    cy = pp[1] + pv[1] * tc - c[1]
+                    if cx * cx + cy * cy < 12.0:
+                        ev += 0.75
+                        self.ffa_seen_proj.add(pid)
+                        self.ffa_kinds['proj'] = self.ffa_kinds.get('proj', 0) + 1
+                        break
+        # 3. beams ending on another mech
+        for bm in obs.get("beams") or []:
+            path = bm.get("path") or []
+            by = bm.get("by")
+            key = (by, round(bm.get("age", 0) + t, 1))
+            if len(path) < 2 or key in self.ffa_seen_beam:
+                continue
+            if any(d2(q, self.pos) < 12.0 for q in path[1:]):
+                self.ffa_seen_beam.add(key)
+                continue
+            for q in path[1:]:
+                hitm = False
+                for m in mechs:
+                    if m.get("id") == by:
+                        continue
+                    if d2(q, m["pos"]) < 6.0:
+                        hitm = True
+                        break
+                if hitm:
+                    ev += 2.0
+                    self.ffa_seen_beam.add(key)
+                    self.ffa_kinds['beam'] = self.ffa_kinds.get('beam', 0) + 1
+                    break
+        # 4. visible mechs losing HP we did not take
+        for m in mechs:
+            mid = m.get("id")
+            hp = m.get("hp")
+            if hp is None:
+                continue
+            prev = self.hp_seen.get(mid)
+            self.hp_seen[mid] = (hp, t)
+            if prev is None or t - prev[1] > 0.35:
+                continue
+            if prev[0] - hp > 40 and t - self.hit_by_us.get(mid, -99) > 0.5:
+                near_npc = any(d2(n["pos"], m["pos"]) < 60 for n in npcs)
+                if not near_npc:
+                    ev += 1.0
+                self.ffa_kinds['hpdrop'] = self.ffa_kinds.get('hpdrop', 0) + 1
+        self.ffa_evidence += ev
+        if ev > 0:
+            self.ffa_log.append((round(t, 1), ev))
+        if self.ffa_evidence >= FFA_THRESHOLD:
+            self.mode = "ffa"
+            log("mode -> ffa at t=%.1f" % t)
 
     # ================================================================ evaluation
     def _wstats(self, kind):
@@ -493,11 +608,20 @@ class Brain:
             if age > 6.0:
                 dps *= 0.3
             if not tr.hostile:
-                dps *= 0.35
+                dps *= 0.8 if self.mode == "ffa" else 0.35
             out.append({"tr": tr, "pos": p, "d": d, "los": los, "dps": dps, "age": age,
                         "hp": tr.hp, "scale": sc, "hostile": tr.hostile})
         out.sort(key=lambda e: e["d"])
         return out
+
+    def _distracted(self, tr):
+        if not tr.aim:
+            return False
+        bto = math.atan2(self.pos[1] - tr.pos[1], self.pos[0] - tr.pos[0])
+        looking_away = abs(angn(tr.aim[0] - bto)) > 0.6
+        hp_prev = self.hp_seen.get(tr.id)
+        losing = tr.hp < tr.max_hp * 0.9
+        return looking_away and (losing or tr.charging)
 
     def _pick_target(self, threats):
         best = None
@@ -524,6 +648,11 @@ class Brain:
                 score += 5.0
             elif d > 160:
                 score -= 4.0
+            if self.mode == "ffa":
+                frac = tr.hp / max(tr.max_hp, 1.0)
+                score += (1.0 - frac) * 6.0
+                if self._distracted(tr):
+                    score += 3.0
             if tr.id == self.last_target_id:
                 score += 1.5
             if best is None or score > best[0]:
@@ -619,6 +748,11 @@ class Brain:
         self.adv = adv
         recent_dmg = sum(e[1] for e in self.dmg_events if t - e[0] < 3.0)
 
+        ffa = self.mode == "ffa"
+        ret_hp = FFA_RET_HP if ffa else RET_HP
+        ret_adv = FFA_RET_ADV if ffa else RET_ADV
+        regen_hp = FFA_REGEN_HP if ffa else REGEN_HP
+
         # ---- retreat hysteresis
         if self.retreating:
             if hp_frac > 0.85 or not hostile or (target is not None and adv > 2.5 and hp_frac > 0.55):
@@ -630,7 +764,7 @@ class Brain:
                 ttk_t = target["tr"].hp / max(self.our_dps(target["d"], 8.0, True), 1.0)
             others = len(hostile) - (1 if target is not None and target["hostile"] else 0)
             finishing = ttk_t < 2.0 and hp_frac > 0.25
-            if not finishing and ((hp_frac < RET_HP and adv < 1.8) or (adv < RET_ADV and hp_frac < 0.85)
+            if not finishing and ((hp_frac < ret_hp and adv < 1.8) or (adv < ret_adv and hp_frac < 0.85)
                                   or (recent_dmg > 0.3 * self.max_hp and adv < 1.3)
                                   or (n_los >= 2 and adv < 1.4)):
                 self.retreating = True
@@ -668,7 +802,7 @@ class Brain:
 
         # ---- regenerate after a fight before starting anything new
         in_combat = t - self.last_combat_t < 4.0
-        if hp_frac < REGEN_HP and not hostile_los:
+        if hp_frac < regen_hp and not hostile_los:
             cv = self._regen_spot(hostile or near)
             self.intent = "REGEN"
             # grab very close cubes on the way
@@ -683,10 +817,17 @@ class Brain:
             self.intent = "LOOT"
             return g, "fast"
 
-        # ---- passive targets: free kills, go close
+        # ---- passive targets: free kills, go close (practice squad only)
         if target is not None and not target["hostile"] and t >= 2.6:
-            self.intent = "HUNT"
-            return None, "hunt"
+            if not ffa:
+                self.intent = "HUNT"
+                return None, "hunt"
+            # free-for-all: only take fights we are likely to win (weak or busy targets)
+            tr = target["tr"]
+            weak = tr.hp < 0.5 * tr.max_hp or self._distracted(tr)
+            if (weak and adv > 1.2 and hp_frac > 0.5) or adv > 2.5:
+                self.intent = "FIGHT"
+                return None, "fight"
 
         # look for prey: remembered passive mechs
         prey = None
@@ -696,6 +837,8 @@ class Brain:
                     prey = e
         held = self._held()
         armed = ("laser" in held or "lightning" in held or self.my_cubes >= 4)
+        if ffa:
+            prey = None
         if prey is not None and armed and prey["d"] < 220 and prey["age"] < 15:
             # points come only from kills: a known victim beats farming crates
             near_farm = g is not None and d2(g, pos) < 30.0
@@ -712,7 +855,29 @@ class Brain:
             self.intent = "PROWL"
             return prey["pos"], "fast"
         self.intent = "EXPLORE"
+        if ffa:
+            return self._ffa_hold_spot(), "walk"
         return self._explore_goal(), "walk"
+
+    def _ffa_hold_spot(self):
+        """Free-for-all idle position: a wall-side spot well inside the next circle."""
+        t = self.t
+        if getattr(self, "_hold", None) is not None and t - self._hold_t < 10.0 and self.zone_ok(self._hold, 3.0, 12.0):
+            return self._hold
+        z = self.zone
+        nc = z.get("next_center", [self.pos[0], self.pos[1]]) if z else [self.pos[0], self.pos[1]]
+        nr = z.get("next_radius", 200) if z else 200
+        best = None
+        if self.world is not None:
+            for dd, x, y in self.world.anchors_near(nc[0], nc[1], max(30.0, nr * 0.55))[:300]:
+                if not self.zone_ok((x, y), d2((x, y), self.pos) / 11.0, 10.0):
+                    continue
+                sc = d2((x, y), self.pos) * 0.5 + math.sqrt(dd) * 0.8
+                if best is None or sc < best[0]:
+                    best = (sc, [x, y, 0.0])
+        self._hold = best[1] if best else [nc[0], nc[1], 0.0]
+        self._hold_t = t
+        return self._hold
 
     def _capturing_drop(self):
         rad = self.c("drops.radius", 8.0)
