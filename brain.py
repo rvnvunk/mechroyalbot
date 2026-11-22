@@ -23,9 +23,9 @@ from mechio import log
 
 TAU = 2.0 * math.pi
 # aggression knobs
-RET_HP = 0.3
-RET_ADV = 0.6
-REGEN_HP = 0.55
+RET_HP = 0.22
+RET_ADV = 0.45
+REGEN_HP = 0.45
 WVAL = {"laser": 1.7, "lightning": 1.5, "gun": 1.0, "mortar": 0.55}
 
 
@@ -56,7 +56,7 @@ def cget(d, path, default):
 class Track:
     __slots__ = ("id", "kind", "pos", "vel", "t_seen", "t_first", "hp", "max_hp", "cubes",
                  "weapons", "aim", "charging", "charge_since", "dmg_to_us", "last_hit_us",
-                 "hostile", "approach", "estimated", "dist_hist")
+                 "hostile", "approach", "estimated", "dist_hist", "vhist")
 
     def __init__(self, m, t):
         self.id = m["id"]
@@ -70,12 +70,17 @@ class Track:
         self.approach = 0.0
         self.estimated = False
         self.dist_hist = []
+        self.vhist = []
         self.update(m, t)
 
     def update(self, m, t):
         self.estimated = False
         self.pos = list(m.get("pos") or [0, 0, 0])
         self.vel = list(m.get("vel") or [0, 0, 0])
+        vh = self.vhist
+        vh.append((t, self.vel[0], self.vel[1]))
+        while vh and t - vh[0][0] > 1.2:
+            vh.pop(0)
         self.t_seen = t
         self.hp = m.get("hp", 1400) if m.get("hp") is not None else 1400
         self.max_hp = m.get("max_hp", 1400) or 1400
@@ -88,6 +93,21 @@ class Track:
         if not ch:
             self.charge_since = None
         self.charging = ch
+
+    def avg_vel(self, window):
+        """Mean horizontal velocity over the last `window` seconds (zig-zag averages out)."""
+        vh = self.vhist
+        if not vh:
+            return self.vel[0], self.vel[1]
+        t1 = vh[-1][0]
+        sx = sy = 0.0
+        n = 0
+        for (tt, vx, vy) in vh:
+            if t1 - tt <= window:
+                sx += vx
+                sy += vy
+                n += 1
+        return (sx / n, sy / n) if n else (self.vel[0], self.vel[1])
 
     def pred(self, t, horizon=2.0):
         dt = min(max(0.0, t - self.t_seen), horizon)
@@ -282,7 +302,11 @@ class Brain:
                 if hv > 3.0:
                     bto = math.atan2(self.pos[1] - tr.pos[1], self.pos[0] - tr.pos[0])
                     head_ok = abs(angn(math.atan2(tr.vel[1], tr.vel[0]) - bto)) < 0.45
-                if rate > 4.5 and dd < 220 and t - t0 > 3.0 and head_ok:
+                aim_ok = False
+                if tr.aim:
+                    bto2 = math.atan2(self.pos[1] - tr.pos[1], self.pos[0] - tr.pos[0])
+                    aim_ok = abs(angn(tr.aim[0] - bto2)) < 0.25
+                if rate > 4.5 and dd < 220 and t - t0 > 3.0 and head_ok and aim_ok:
                     tr.hostile = True
             if tr.charging and dd < 290:
                 b = math.atan2(self.pos[1] - tr.pos[1], self.pos[0] - tr.pos[0])
@@ -653,18 +677,26 @@ class Brain:
             self.intent = "HUNT"
             return None, "hunt"
 
-        if g is not None or self.loot_kind in ("npc", "crate"):
-            self.intent = "LOOT"
-            return g, ("fast" if g is not None else "stop")
-        if urg > 0.5 and zpt is not None:
-            self.intent = "ZONE"
-            return zpt, "fast"
         # look for prey: remembered passive mechs
         prey = None
         for e in threats:
             if not e["hostile"] and e["age"] < 20 and self.zone_ok(e["pos"], e["d"] / 11.0, 10.0):
                 if prey is None or e["d"] < prey["d"]:
                     prey = e
+        held = self._held()
+        armed = ("laser" in held or "lightning" in held or self.my_cubes >= 4)
+        if prey is not None and armed and prey["d"] < 220 and prey["age"] < 15:
+            # points come only from kills: a known victim beats farming crates
+            near_farm = g is not None and d2(g, pos) < 30.0
+            if not near_farm and self.loot_kind not in ("npc", "crate") or g is not None and d2(g, pos) > 30.0:
+                self.intent = "PROWL"
+                return prey["pos"], "fast"
+        if g is not None or self.loot_kind in ("npc", "crate"):
+            self.intent = "LOOT"
+            return g, ("fast" if g is not None else "stop")
+        if urg > 0.5 and zpt is not None:
+            self.intent = "ZONE"
+            return zpt, "fast"
         if prey is not None:
             self.intent = "PROWL"
             return prey["pos"], "fast"
@@ -848,7 +880,7 @@ class Brain:
         best = None
         for _ in range(12):
             a = self.rng.uniform(-math.pi, math.pi)
-            r = nr * math.sqrt(self.rng.uniform(0.0, 0.6))
+            r = nr * math.sqrt(self.rng.uniform(0.0, 0.35))
             p = [nc[0] + math.cos(a) * r, nc[1] + math.sin(a) * r, 0.0]
             if self.world is not None and not self.world.walkable(p[0], p[1]):
                 continue
@@ -964,7 +996,7 @@ class Brain:
             mv = self._steer_to(goal)
             dist = d2(goal, pos)
             if style == "walk":
-                speed = 0.42 if not threats else 1.0
+                speed = 1.0
             if style == "fast" and dist > 25 and self.energy > energy_reserve + 20:
                 boost = self.intent in ("ZONE", "RETREAT")
             if dist < 2.0:
@@ -1272,8 +1304,17 @@ class Brain:
         if target is not None and target["age"] < 1.0:
             tr = target["tr"]
             sc = target["scale"]
-            tgt = {"pos": tr.pred(self.t, 0.3), "vel": tr.vel, "h": 4.5 * sc, "r": 2.5 * sc,
-                   "kind": "mech", "d": target["d"], "id": tr.id, "airborne": abs(tr.vel[2]) > 0.5}
+            d_ = target["d"]
+            # long flight times: aim at the centre of a zig-zag rather than its current leg
+            fl = d_ / 252.0
+            if fl > 0.2 and len(tr.vhist) >= 5:
+                ax, ay = tr.avg_vel(min(1.0, 1.6 * fl + 0.3))
+                wb = min(1.0, (fl - 0.2) / 0.35)
+                lv = [tr.vel[0] * (1 - wb) + ax * wb, tr.vel[1] * (1 - wb) + ay * wb, tr.vel[2]]
+            else:
+                lv = tr.vel
+            tgt = {"pos": tr.pred(self.t, 0.3), "vel": lv, "h": 4.5 * sc, "r": 2.5 * sc,
+                   "kind": "mech", "d": d_, "id": tr.id, "airborne": abs(tr.vel[2]) > 0.5}
         elif self.intent != "REGEN" and self.t >= 2.6:
             tgt = self._farm_target()
 
