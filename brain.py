@@ -120,6 +120,7 @@ class Brain:
         self.cover_t = -99.0
         self.fight_cover = None
         self.fight_cover_t = -99.0
+        self.hunt_boost = False
         self.range_d = 90.0
         self.range_t = -99.0
         self.range_for = None
@@ -917,8 +918,9 @@ class Brain:
         energy_reserve = 40 if has_light else 15
 
         if style in ("fight", "hunt") and target is not None:
+            self.hunt_boost = False
             mv, speed = self._fight_move(target, threats, passive=(style == "hunt"))
-            boost = False
+            boost = self.hunt_boost
         elif style == "stop":
             mv, speed = (0.0, 0.0), 0.0
         elif style == "retreat" and goal is not None:
@@ -981,6 +983,7 @@ class Brain:
                 self.strafe_until = t + self.rng.uniform(0.8, 1.6)
             perp = (-to[1] * self.strafe_sign, to[0] * self.strafe_sign)
             if d > hi + 20 or not target.get("myl", True):
+                self.hunt_boost = d > 60 and self.energy > (70 if "lightning" in held else 35)
                 return self._steer_to(tr.pos), 1.0
             mv = (to[0] * radial + perp[0] * 0.5, to[1] * radial + perp[1] * 0.5)
             return unit(mv), 1.0
@@ -1517,16 +1520,19 @@ class Brain:
             tot += share[k]
         for k in share:
             share[k] = share[k] / tot if tot else 0.0
+        # with only the starting gun we will probably swap it later: weapon upgrades are worth less
+        wscale = 0.6 if len(held) < 2 else 1.0
         base = {
-            "plating": 16, "armor": 13, "nanites": 11, "gyros": 6, "servos": 6, "sensors": 3,
-            "capacitor": 3 + 8 * share["lightning"], "reactor": 3 + 8 * share["lightning"], "jets": 3,
-            "laser_damage": 22 * share["laser"], "laser_charge": 15 * share["laser"], "laser_pierce": 2 * share["laser"],
-            "gun_damage": 18 * share["gun"], "gun_rate": 17 * share["gun"], "gun_mag": 9 * share["gun"],
-            "gun_velocity": 8 * share["gun"],
-            "lightning_efficiency": 18 * share["lightning"], "lightning_range": 12 * share["lightning"],
-            "lightning_chain": 4 * share["lightning"],
-            "mortar_splash": 4 * share["mortar"], "mortar_reload": 5 * share["mortar"],
-            "mortar_velocity": 3 * share["mortar"],
+            "plating": 18, "armor": 15, "nanites": 10, "gyros": 5, "servos": 5, "sensors": 3,
+            "capacitor": 3 + 6 * share["lightning"], "reactor": 3 + 6 * share["lightning"], "jets": 2,
+            "laser_damage": 16 * share["laser"] * wscale, "laser_charge": 10 * share["laser"] * wscale,
+            "laser_pierce": 2 * share["laser"],
+            "gun_damage": 12 * share["gun"] * wscale, "gun_rate": 12 * share["gun"] * wscale,
+            "gun_mag": 6 * share["gun"] * wscale, "gun_velocity": 6 * share["gun"] * wscale,
+            "lightning_efficiency": 13 * share["lightning"] * wscale, "lightning_range": 9 * share["lightning"] * wscale,
+            "lightning_chain": 3 * share["lightning"],
+            "mortar_splash": 3 * share["mortar"], "mortar_reload": 4 * share["mortar"],
+            "mortar_velocity": 2 * share["mortar"],
         }
         best_i, best_s = 0, -1e9
         for i, ch in enumerate(offer.get("choices") or []):
