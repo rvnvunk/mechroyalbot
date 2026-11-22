@@ -61,8 +61,14 @@ PF_W = float(os.environ.get("PF_W", "1.0"))
 LOOT_PLUS = int(os.environ.get("LOOT_PLUS", "0"))
 CANOPY = os.environ.get("CANOPY", "0") == "1"   # tree crowns block sight (vision config canopy_blocks)
 LIGHT_FIRST = int(os.environ.get("LIGHT_FIRST", "0"))
-AGGRO = int(os.environ.get("AGGRO", "1"))
+AGGRO = int(os.environ.get("AGGRO", "0"))
 AGGRO_QUIET = float(os.environ.get("AGGRO_QUIET", "6"))
+RET2 = int(os.environ.get("RET2", "0"))
+REGEN_MULT = float(os.environ.get("REGEN_MULT", "1.0"))
+UPG_DMG_W = float(os.environ.get("UPG_DMG_W", "1.0"))
+PREY_AWAY = float(os.environ.get("PREY_AWAY", "0"))
+HUNT_D_MIN = float(os.environ.get("HUNT_D_MIN", "0"))
+CUBE_URG = float(os.environ.get("CUBE_URG", "90"))
 PEEK_R = float(os.environ.get("PEEK_R", "14"))
 TEMPO_HP = float(os.environ.get("TEMPO_HP", "0.85"))
 TEMPO_QUIET = float(os.environ.get("TEMPO_QUIET", "8"))
@@ -724,6 +730,13 @@ class Brain:
             if self.mode == "ffa" and not tr.hostile and not (tr.hp < 0.5 * tr.max_hp or self._distracted(tr)):
                 value -= 0.6
             score = value / max(t_tot, 0.5)
+            if PREY_AWAY > 0 and not tr.hostile and self.mode != "ffa":
+                # a passive next to the hunters drags us into their crossfire
+                hn = [o for o in threats if o["hostile"] and o["age"] < 12.0]
+                if hn:
+                    near_h = min(d2(o["pos"], e["pos"]) for o in hn)
+                    if near_h < 140.0:
+                        score *= max(0.2, 1.0 - PREY_AWAY * (140.0 - near_h) / 140.0)
             if tr.hostile and self.mode != "ffa" and PF_W != 1.0:
                 # practice squad releases hunters weakest first: a dead hunter is replaced by a stronger one,
                 # a dead passive removes a strong mech from the pool
@@ -848,6 +861,8 @@ class Brain:
             # the practice squad never loses track of us: hiding only hands them time
             self.retreating = False
             proj = None
+        if RET2 and not ffa and len(engaged) >= RET2 and not self.retreating:
+            self.retreating = True
         if self.retreating:
             if not engaged or hp_frac > 0.9 or (proj is not None and proj[0] >= proj[3] and proj[1] > safety * 2):
                 self.retreating = False
@@ -927,7 +942,7 @@ class Brain:
                                or (self.loot_kind == "cube" and gd < 18) or target is None)
             else:
                 urgent_loot = (self.loot_kind == "drop" or (self.loot_kind == "pick" and gd < 120)
-                               or (self.loot_kind == "cube" and gd < 35)
+                               or (self.loot_kind == "cube" and gd < (CUBE_URG if self.my_cubes < 10 else 35))
                                or target is None or target["hostile"] or ffa)
             if urgent_loot:
                 self.intent = "LOOT"
@@ -957,10 +972,16 @@ class Brain:
 
         # look for prey: remembered passive mechs
         prey = None
+        hn = [o for o in threats if o["hostile"] and o["age"] < 12.0] if PREY_AWAY > 0 else []
+        best_pd = None
         for e in threats:
             if not e["hostile"] and e["age"] < 20 and self.zone_ok(e["pos"], e["d"] / 11.0, 10.0):
-                if prey is None or e["d"] < prey["d"]:
-                    prey = e
+                pd = e["d"]
+                if hn:
+                    near_h = min(d2(o["pos"], e["pos"]) for o in hn)
+                    pd += PREY_AWAY * max(0.0, 140.0 - near_h)
+                if prey is None or pd < best_pd:
+                    prey, best_pd = e, pd
         held = self._held()
         armed = ("laser" in held or "lightning" in held or self.my_cubes >= 4)
         if ffa or not self._prey_ok():
@@ -1062,7 +1083,7 @@ class Brain:
                 best = cost
         if best is None:
             return 0.6 * self.max_hp
-        need = best * self.model.shooters_avg()
+        need = best * self.model.shooters_avg() * REGEN_MULT
         if ffa:
             need *= 1.6
         return min(0.9 * self.max_hp, max(0.15 * self.max_hp, need))
@@ -1523,7 +1544,10 @@ class Brain:
         if top <= 0:
             return 30.0
         ok = [dd for dd, v in vals if v >= 0.92 * top]
-        return max(ok) if ok else 30.0
+        hd = max(ok) if ok else 30.0
+        if HUNT_D_MIN > 0 and "laser" in self._held() and self.mode != "ffa":
+            hd = max(hd, HUNT_D_MIN)
+        return hd
 
     def _shot_ready(self, tr, d):
         """Is our main weapon ready to deliver a hit now (so exposing ourselves pays)?"""
@@ -2208,6 +2232,10 @@ class Brain:
             "mortar_splash": 0.05 * share["mortar"], "mortar_reload": 0.18 * share["mortar"],
             "mortar_velocity": 0.03 * share["mortar"],
         }
+        if UPG_DMG_W != 1.0 and not ffa:
+            for k in list(base):
+                if k.startswith(("gun_", "laser_", "lightning_", "mortar_")):
+                    base[k] *= UPG_DMG_W
         # we may still swap the starting gun away: discount upgrades for weapons we might drop
         if len(held) < 2:
             for k in list(base):
