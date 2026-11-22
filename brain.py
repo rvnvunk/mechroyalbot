@@ -207,6 +207,7 @@ class Brain:
         self.kills = 0
         self.model = CombatModel({})
         self.prev_t = None
+        self.hp_lost = 0.0
         self.last_kill_hostile = {}
         self.prev_ammo = None
         self.prev_charge = 0.0
@@ -371,6 +372,7 @@ class Brain:
             if ty == "damaged":
                 self.last_damaged_t = t
                 self.last_combat_t = t
+                self.hp_lost += ev.get("amount", 0.0)
                 if ev.get("weapon") == "npc" and ev.get("by") is not None:
                     self.npc_attackers[ev["by"]] = t
                 self.dmg_events.append((t, ev.get("amount", 0), ev.get("by"), ev.get("bearing"), ev.get("weapon")))
@@ -527,99 +529,19 @@ class Brain:
 
     # ================================================================ mode
     def _update_mode(self, obs):
-        """Practice squad (house bots never fight each other) or free-for-all?"""
+        """Practice squad or free-for-all?
+
+        In practice the house bots never fight each other: a death we did not cause almost
+        never happens (measured: 0.04 per match with a bot that never fires). In a
+        free-for-all they happen within seconds. Two such deaths decide it.
+        """
         if self.mode == "ffa":
             return
-        t = self.t
-        ev = 0.0
-        mechs = [m for m in (obs.get("mechs") or []) if m.get("kind") == "mech" and m.get("id") != self.my_id]
-        npcs = [m for m in (obs.get("mechs") or []) if m.get("kind") == "npc"]
-        # 1. deaths we did not cause
         dead_others = (self.n_mechs - self.alive) - self.kills
-        if dead_others > getattr(self, "_dead_seen", 0):
-            if t < 200:
-                ev += 2.5 * (dead_others - getattr(self, "_dead_seen", 0))
-            self.ffa_kinds['death'] = self.ffa_kinds.get('death', 0) + 1
-            self._dead_seen = dead_others
-        # 2. bullets flying at another mech
-        for p in obs.get("projectiles") or []:
-            pid = p.get("id")
-            if pid in self.ffa_seen_proj or p.get("kind") not in ("gun", "mortar"):
-                continue
-            pp, pv = p.get("pos"), p.get("vel")
-            if not pp or not pv:
-                continue
-            vv = pv[0] ** 2 + pv[1] ** 2
-            if vv < 1:
-                continue
-            # bullets aimed at us (or passing near us) say nothing about free-for-all
-            rx0, ry0 = self.pos[0] - pp[0], self.pos[1] - pp[1]
-            tc0 = (rx0 * pv[0] + ry0 * pv[1]) / vv
-            if tc0 > -0.05:
-                cx0 = pp[0] + pv[0] * max(tc0, 0.0) - self.pos[0]
-                cy0 = pp[1] + pv[1] * max(tc0, 0.0) - self.pos[1]
-                if cx0 * cx0 + cy0 * cy0 < 15.0 ** 2:
-                    self.ffa_seen_proj.add(pid)
-                    continue
-            for m in mechs:
-                c = m["pos"]
-                rx, ry = c[0] - pp[0], c[1] - pp[1]
-                if rx * rx + ry * ry < 36:
-                    continue
-                tc = (rx * pv[0] + ry * pv[1]) / vv
-                if 0.02 < tc < 0.8:
-                    cx = pp[0] + pv[0] * tc - c[0]
-                    cy = pp[1] + pv[1] * tc - c[1]
-                    if cx * cx + cy * cy < 12.0:
-                        ev += 0.75
-                        self.ffa_seen_proj.add(pid)
-                        self.ffa_kinds['proj'] = self.ffa_kinds.get('proj', 0) + 1
-                        break
-        # 3. beams ending on another mech
-        for bm in obs.get("beams") or []:
-            path = bm.get("path") or []
-            by = bm.get("by")
-            key = (by, round(bm.get("age", 0) + t, 1))
-            if len(path) < 2 or key in self.ffa_seen_beam:
-                continue
-            if any(d2(q, self.pos) < 12.0 for q in path[1:]):
-                self.ffa_seen_beam.add(key)
-                continue
-            for q in path[1:]:
-                hitm = False
-                for m in mechs:
-                    if m.get("id") == by:
-                        continue
-                    if d2(q, m["pos"]) < 6.0:
-                        hitm = True
-                        break
-                if hitm:
-                    ev += 2.0
-                    self.ffa_seen_beam.add(key)
-                    self.ffa_kinds['beam'] = self.ffa_kinds.get('beam', 0) + 1
-                    break
-        # 4. visible mechs losing HP we did not take
-        for m in mechs:
-            mid = m.get("id")
-            hp = m.get("hp")
-            if hp is None:
-                continue
-            prev = self.hp_seen.get(mid)
-            self.hp_seen[mid] = (hp, t)
-            if prev is None or t - prev[1] > 0.35:
-                continue
-            if prev[0] - hp > 40 and t - self.hit_by_us.get(mid, -99) > 0.5:
-                near_npc = any(d2(n["pos"], m["pos"]) < 60 for n in npcs)
-                if not near_npc and self.ffa_kinds.get("hpdrop", 0) < 3:
-                    ev += 1.0
-                self.ffa_kinds['hpdrop'] = self.ffa_kinds.get('hpdrop', 0) + 1
-        self.ffa_evidence += ev
-        if ev > 0:
-            self.ffa_log.append((round(t, 1), ev))
-        kinds = sum(1 for k, v in self.ffa_kinds.items() if v > 0)
-        if (self.ffa_evidence >= FFA_THRESHOLD and kinds >= 2) or self.ffa_evidence >= 20.0:
+        self.ffa_evidence = float(dead_others)
+        if dead_others >= 2:
             self.mode = "ffa"
-            log("mode -> ffa at t=%.1f" % t)
+            log("mode -> ffa at t=%.1f" % self.t)
 
     # ================================================================ evaluation
     def _wstats(self, kind):
@@ -717,8 +639,19 @@ class Brain:
         return looking_away and (losing or tr.charging)
 
     def _pick_target(self, threats):
+        """Choose the target with the best net kill rate.
+
+        value  = 1 kill
+               + kills saved by silencing it (its dps over the rest of the fight, in kills)
+               - kills lost to the damage we take while killing it
+        rate   = value / time to kill (including the walk when it is out of sight)
+        """
         best = None
         my_m = (self.pos[0], self.pos[1], self.pos[2] + self.stats.get("muzzle_height", 7.0))
+        kappa = self._kills_per_hp()
+        hostiles = [e for e in threats if e["hostile"] and e["age"] < 3.0 and (e["los"] or e["d"] < 60)]
+        inc = sum(e["dps"] for e in hostiles)
+        walk = self.stats.get("walk_speed", 11.7)
         for e in threats:
             if e["age"] > 1.0:
                 continue
@@ -732,22 +665,22 @@ class Brain:
             if mydps <= 0 and not los:
                 continue
             ttk = tr.hp / max(mydps, 1.0)
-            score = -ttk - d / 60.0
-            if not los:
-                score -= 6.0
-            if self.t - tr.last_hit_us < 3.0:
-                score += 4.0
-            if tr.hostile:
-                score += HOSTILE_BONUS
-            elif d > 160:
-                score -= 4.0
-            if self.mode == "ffa":
-                frac = tr.hp / max(tr.max_hp, 1.0)
-                score += (1.0 - frac) * 6.0
-                if self._distracted(tr):
-                    score += 3.0
+            t_reach = 0.0 if los else min(d, 80.0) / walk
+            if not los and mydps <= 0:
+                t_reach = d / walk
+            t_tot = ttk + t_reach
+            # damage we eat meanwhile (everyone already shooting at us)
+            cost = inc * t_tot * kappa
+            # silencing a shooter: its dps no longer hits us during the rest of the fight
+            others_ttk = sum(o["tr"].hp / max(self.our_dps(o["d"], 8.0, True), 1.0) for o in hostiles if o is not e)
+            relief = e["dps"] * others_ttk * kappa if tr.hostile else 0.0
+            value = 1.0 + relief - cost
+            # in a free-for-all a kill is only worth it when we come out ahead; weak/busy targets are cheaper
+            if self.mode == "ffa" and not tr.hostile and not (tr.hp < 0.5 * tr.max_hp or self._distracted(tr)):
+                value -= 0.6
+            score = value / max(t_tot, 0.5)
             if tr.id == self.last_target_id:
-                score += 1.5
+                score *= 1.15   # switching costs aim time
             if best is None or score > best[0]:
                 best = (score, e)
         if best is None:
@@ -1040,6 +973,11 @@ class Brain:
         return out
 
     def _kills_per_hp(self):
+        """Kills per HP point, measured in this match (prior: one kill per 300 HP lost)."""
+        k0 = 2.0
+        return (self.kills + k0) / (self.hp_lost + k0 * 300.0)
+
+    def _kills_per_hp_model(self):
         held = self._held()
         stats = {w.get("kind"): (w.get("stats") or {}) for w in self.weapons if w}
         return self.model.loadout_value(held, stats, self.our_mult(), self._enemy_kinds_seen())
@@ -1385,7 +1323,8 @@ class Brain:
         their = tr.weapons
         if passive:
             # it is not shooting back: get close and behind it (rear hits deal x1.5)
-            lo, hi = 12.0, min(28.0, HUNT_HI) if "lightning" in held else HUNT_HI
+            hi = self._hunt_distance()
+            lo = max(8.0, hi - 18.0)
             face = tr.aim[0] if tr.aim else 0.0
             back = (tr.pos[0] - math.cos(face) * (lo + hi) * 0.5, tr.pos[1] - math.sin(face) * (lo + hi) * 0.5)
             rel = math.atan2(pos[1] - tr.pos[1], pos[0] - tr.pos[0])
@@ -1487,6 +1426,16 @@ class Brain:
         if not target.get("myl", True) and d < 120 and self.hp > 0.45 * self.max_hp:
             mv = self._steer_to(tr.pos)
         return unit(mv), 1.0
+
+    def _hunt_distance(self):
+        """Farthest distance where our damage output is still close to its best (no return fire)."""
+        cands = (14.0, 22.0, 30.0, 40.0, 52.0, 70.0, 90.0)
+        vals = [(dd, self.our_dps(dd, 3.0, True)) for dd in cands]
+        top = max(v for _, v in vals) if vals else 0.0
+        if top <= 0:
+            return 30.0
+        ok = [dd for dd, v in vals if v >= 0.92 * top]
+        return max(ok) if ok else 30.0
 
     def _isolation_spot(self, tr, shooters):
         """Nearby walkable spot that keeps the target in view and hides us from the other shooters."""
