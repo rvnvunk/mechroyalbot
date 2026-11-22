@@ -23,9 +23,9 @@ from mechio import log
 
 TAU = 2.0 * math.pi
 # aggression knobs
-RET_HP = 0.35
-RET_ADV = 0.8
-REGEN_HP = 0.7
+RET_HP = 0.3
+RET_ADV = 0.6
+REGEN_HP = 0.55
 WVAL = {"laser": 1.7, "lightning": 1.5, "gun": 1.0, "mortar": 0.55}
 
 
