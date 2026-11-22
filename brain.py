@@ -40,7 +40,7 @@ WVAL = {"laser": 1.7, "lightning": float(os.environ.get("W_LIGHT", "0.9")), "gun
 CUBE_VAL = float(os.environ.get("CUBE_VAL", "13"))
 HOSTILE_BONUS = float(os.environ.get("HOSTILE_BONUS", "5"))
 KITE = os.environ.get("KITE", "0") == "1"
-FIGHT_BOOST = os.environ.get("FIGHT_BOOST", "1") == "1"
+FIGHT_BOOST = os.environ.get("FIGHT_BOOST", "0") == "1"
 STRAFE_LO = float(os.environ.get("STRAFE_LO", "0.35"))
 STRAFE_HI = float(os.environ.get("STRAFE_HI", "0.95"))
 RANGE_MIN = float(os.environ.get("RANGE_MIN", "0"))
@@ -55,9 +55,12 @@ FARM_EARLY = float(os.environ.get("FARM_EARLY", "0"))
 ISO = os.environ.get("ISO", "1") == "1"
 FIGHT_RANGE_SCALE = float(os.environ.get("FIGHT_RANGE_SCALE", "1.0"))
 TEMPO = int(os.environ.get("TEMPO", "0"))
-PEEK = int(os.environ.get("PEEK", "1"))
+PEEK = int(os.environ.get("PEEK", "0"))
 BLITZ = int(os.environ.get("BLITZ", "0"))
 PF_W = float(os.environ.get("PF_W", "1.0"))
+LOOT_PLUS = int(os.environ.get("LOOT_PLUS", "0"))
+CANOPY = os.environ.get("CANOPY", "1") == "1"   # tree crowns block sight (vision config canopy_blocks)
+LIGHT_FIRST = int(os.environ.get("LIGHT_FIRST", "0"))
 PEEK_R = float(os.environ.get("PEEK_R", "14"))
 TEMPO_HP = float(os.environ.get("TEMPO_HP", "0.85"))
 TEMPO_QUIET = float(os.environ.get("TEMPO_QUIET", "8"))
@@ -193,6 +196,7 @@ class Brain:
         self.iso_spot = None
         self.iso_t = -99.0
         self.iso_for = None
+        self.canopy = False
         self.pk_cache = (None, None)
         self.pk_t = -99.0
         self.pk_for = None
@@ -247,6 +251,8 @@ class Brain:
         except Exception as e:
             log("world load failed:", repr(e))
             self.world = None
+        self.canopy = bool(cget(self.cfg, "vision.canopy_blocks", False)) and hasattr(self.world, "vis") \
+            and getattr(self.world, "kb", None) is not None
         return "Hunter-v2"
 
     def on_end(self, msg):
@@ -259,6 +265,14 @@ class Brain:
     def los(self, a, b):
         if self.world is None:
             return True
+        return self.world.los(a[0], a[1], a[2], b[0], b[1], b[2])
+
+    def vis(self, a, b):
+        """Can an eye at a see point b (terrain, buildings and, in the real game, tree crowns)."""
+        if self.world is None:
+            return True
+        if CANOPY and self.canopy:
+            return self.world.vis(a[0], a[1], a[2], b[0], b[1], b[2])
         return self.world.los(a[0], a[1], a[2], b[0], b[1], b[2])
 
     def eye(self, p, scale=1.0):
@@ -628,7 +642,7 @@ class Brain:
             their_eye = (p[0], p[1], p[2] + 8.0 * sc)
             if age < 0.15 and budget > 0:
                 budget -= 1
-                los = self.los(their_eye, my_c) or self.los(their_eye, (my_c[0], my_c[1], my_c[2] + 3.5 * self.scale))
+                los = self.vis(their_eye, my_c) or self.vis(their_eye, (my_c[0], my_c[1], my_c[2] + 3.5 * self.scale))
             else:
                 los = age < 6.0 and d < 60
             dps = self.enemy_dps(tr, d) if (los or d < 50) else self.enemy_dps(tr, d) * 0.25
@@ -891,9 +905,15 @@ class Brain:
 
         # ---- loot first only when it is close (or a real weapon upgrade / supply drop)
         g = self._loot_goal(near, urg)
+        if LOOT_PLUS and g is not None and self.loot_kind in ("npc", "crate") and self.my_cubes < 10 \
+                and d2(g, pos) < 70 and not hostile_los:
+            self.intent = "LOOT"
+            return g, "fast"
         if g is not None and self.loot_kind in ("pick", "cube", "drop"):
             gd = d2(g, pos)
-            if BLITZ and not ffa:
+            if LOOT_PLUS and not ffa:
+                urgent_loot = True
+            elif BLITZ and not ffa:
                 urgent_loot = ((self.loot_kind == "drop" and gd < 80) or (self.loot_kind == "pick" and gd < 45)
                                or (self.loot_kind == "cube" and gd < 18) or target is None)
             else:
@@ -1081,8 +1101,18 @@ class Brain:
         held = self._held()
         if kind in held:
             return 0.0, None
-        cur = self._loadout_value(held)
         slots = [w.get("kind") if w else None for w in self.weapons]
+        if LIGHT_FIRST and self.mode != "ffa":
+            if kind == "lightning":
+                if None in slots:
+                    return 1.0, None
+                for wi, k in enumerate(slots):
+                    if k not in ("gun", "lightning"):
+                        return 1.0, wi
+                return 1.0, (1 if len(slots) > 1 else 0)
+            if "lightning" in held:
+                return 0.0, None
+        cur = self._loadout_value(held)
         if None in slots:
             new = self._loadout_value(held + [kind])
             return (new - cur) / max(cur, 1e-9), None
@@ -1279,8 +1309,8 @@ class Brain:
         for e in sees:
             sc = e["scale"]
             te = (e["pos"][0], e["pos"][1], e["pos"][2] + 8.0 * sc)
-            if w.los(te[0], te[1], te[2], p[0], p[1], gz + 4.5 * self.scale) or \
-                    w.los(te[0], te[1], te[2], p[0], p[1], gz + 8.6 * self.scale):
+            if self.vis(te, (p[0], p[1], gz + 4.5 * self.scale)) or \
+                    self.vis(te, (p[0], p[1], gz + 8.6 * self.scale)):
                 return False
         return True
 
@@ -1543,7 +1573,7 @@ class Brain:
             for e in hs:
                 sc = e["scale"]
                 ee = (e["pos"][0], e["pos"][1], e["pos"][2] + 8.0 * sc)
-                if w.los(ee[0], ee[1], ee[2], body[0], body[1], body[2]) or w.los(ee[0], ee[1], ee[2], head[0], head[1], head[2]):
+                if self.vis(ee, body) or self.vis(ee, head):
                     if e["tr"].id == tr.id:
                         seen_t = True
                     else:
@@ -1598,10 +1628,10 @@ class Brain:
                     continue
                 sc = e["scale"]
                 ee = (e["pos"][0], e["pos"][1], e["pos"][2] + 8.0 * sc)
-                if w.los(ee[0], ee[1], ee[2], body[0], body[1], body[2]) or w.los(ee[0], ee[1], ee[2], head[0], head[1], head[2]):
+                if self.vis(ee, body) or self.vis(ee, head):
                     exposure += max(e["dps"], 20.0)
-            sees_target = w.los(head[0], head[1], gz + self.stats.get("muzzle_height", 7.0),
-                                tp[0], tp[1], tp[2] + 4.5)
+            sees_target = self.vis((head[0], head[1], gz + self.stats.get("muzzle_height", 7.0)),
+                                   (tp[0], tp[1], tp[2] + 4.5))
             score = exposure + (0.0 if sees_target else 60.0) + d2((x, y), pos) * 0.8
             if best is None or score < best[0]:
                 best = (score, [x, y, gz])

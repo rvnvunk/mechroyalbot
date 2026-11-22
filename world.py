@@ -146,6 +146,84 @@ class World:
                                row[icr] if icr is not None else 3.0,
                                row[icb] if icb is not None else 3.0, cx, cy))
 
+        self._build_canopy()
+
+    def _build_canopy(self):
+        """Raster of tree crowns (they block sight in the real game): per 1 m cell the lowest
+        and highest crown height in cm, crowns modelled as ellipsoids."""
+        N = self.N
+        kb = array.array("h", [NOB]) * N
+        kt = array.array("h", [NOT]) * N
+        nx, ny, minX, minY = self.nx, self.ny, self.minX, self.minY
+        ncell = 0
+        for (x, y, z, h, cr, cbz, cx, cy) in self.trees:
+            if h is None or cr is None or cr <= 0.3:
+                continue
+            if z is None or z == 0.0:
+                z = self.ground_z(x, y)
+            cbz = cbz if cbz is not None else 3.0
+            if h <= cbz + 0.5:
+                continue
+            zc = z + 0.5 * (cbz + h)
+            hh = 0.5 * (h - cbz)
+            R = cr
+            i0 = int(cx - R - minX); i1 = int(cx + R - minX) + 1
+            j0 = int(cy - R - minY); j1 = int(cy + R - minY) + 1
+            for j in range(max(0, j0), min(ny, j1 + 1)):
+                py = minY + j
+                for i in range(max(0, i0), min(nx, i1 + 1)):
+                    px = minX + i
+                    rho2 = ((px - cx) ** 2 + (py - cy) ** 2) / (R * R)
+                    if rho2 >= 1.0:
+                        continue
+                    span = hh * math.sqrt(1.0 - rho2)
+                    lo = int((zc - span) * 100.0)
+                    hi = int((zc + span) * 100.0)
+                    c = j * nx + i
+                    if lo < kb[c]:
+                        kb[c] = max(-32000, lo)
+                    if hi > kt[c]:
+                        kt[c] = min(32000, hi)
+                    ncell += 1
+        self.kb = kb
+        self.kt = kt
+        self.canopy_cells = ncell
+
+    def vis(self, x0, y0, z0, x1, y1, z1, step=1.0):
+        """Line of sight for vision: terrain, prisms and tree crowns."""
+        dx = x1 - x0
+        dy = y1 - y0
+        dz = z1 - z0
+        hd = math.hypot(dx, dy)
+        n = int(max(hd, abs(dz)) / step) + 1
+        if n < 2:
+            return True
+        minX = self.minX - 0.5
+        minY = self.minY - 0.5
+        nx, ny = self.nx, self.ny
+        g, cb, ct, multi, kb, kt = self.ground, self.cbase, self.ctop, self.multi, self.kb, self.kt
+        inv = 1.0 / n
+        for k in range(1, n):
+            t = k * inv
+            i = int(x0 + dx * t - minX)
+            j = int(y0 + dy * t - minY)
+            if i < 0 or j < 0 or i >= nx or j >= ny:
+                return False
+            c = j * nx + i
+            zc = (z0 + dz * t) * 100.0
+            if zc < g[c]:
+                return False
+            if kb[c] <= zc <= kt[c]:
+                return False
+            if cb[c] <= zc <= ct[c]:
+                m = multi.get(c)
+                if m is None:
+                    return False
+                for b_, t_ in m:
+                    if b_ <= zc <= t_:
+                        return False
+        return True
+
     # ------------------------------------------------------------ queries
     def cell(self, x, y):
         i = int(x - self.minX + 0.5)
@@ -320,6 +398,22 @@ class World:
         self.walk = walk
         self._label_components()
         self._build_anchors()
+        self._add_tree_anchors()
+
+    def _add_tree_anchors(self):
+        """Spots under tree crowns: hidden from sight when crowns block vision."""
+        self.tree_spots = []
+        if not getattr(self, "trees", None):
+            return
+        B = self.anchor_B
+        for (x, y, z, h, cr, cbz, cx, cy) in self.trees:
+            if cr is None or cr < 2.2 or h is None or h < 7.0:
+                continue
+            if not self.walkable(cx, cy):
+                continue
+            self.tree_spots.append((cx, cy))
+            k = (int((cx - self.minX) // B), int((cy - self.minY) // B))
+            self.anchor_buckets.setdefault(k, []).append((cx, cy))
 
     def _label_components(self):
         NX, NY, walk = self.NX, self.NY, self.walk
