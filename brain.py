@@ -21,6 +21,7 @@ import random
 import time
 
 from mechio import log
+from model import CombatModel
 
 TAU = 2.0 * math.pi
 # aggression knobs
@@ -204,6 +205,12 @@ class Brain:
         self.explore_goal = None
         self.explore_t = -99.0
         self.kills = 0
+        self.model = CombatModel({})
+        self.prev_t = None
+        self.last_kill_hostile = {}
+        self.prev_ammo = None
+        self.prev_charge = 0.0
+        self.fire_tgt = None      # (is_mech, distance, hostile) of what we aimed at last tick
         self.deadline = 1e18
         self.loot_kind = None
         self.adv = 99.0
@@ -213,6 +220,7 @@ class Brain:
     # ================================================================ hello
     def on_hello(self, msg):
         self.cfg = msg.get("config") or {}
+        self.model = CombatModel(self.cfg)
         self.n_mechs = cget(self.cfg, "match.mechs", 16)
         self.rng = random.Random(msg.get("seed", 1))
         self.slot = msg.get("slot", 0)
@@ -277,6 +285,7 @@ class Brain:
 
         self._update_memory(obs)
         self._update_mode(obs)
+        self._learn(obs)
 
         # ---------------- upgrades
         offer = obs.get("offer")
@@ -400,6 +409,8 @@ class Brain:
             elif ty == "kill":
                 self.kills += 1
                 tid = ev.get("target")
+                if tid in self.tracks:
+                    self.last_kill_hostile[tid] = self.tracks[tid].hostile
                 self.dead_ids.add(tid)
                 self.tracks.pop(tid, None)
             elif ty == "took":
@@ -452,6 +463,67 @@ class Brain:
                 p = self.npcs[k][0]
                 if d2(p, self.pos) < 35.0 or t - self.npcs[k][3] > 60.0:
                     del self.npcs[k]
+
+    # ================================================================ learning
+    def _learn(self, obs):
+        """Feed the combat model with what happened since the last observation."""
+        t = self.t
+        dt = 0.1 if self.prev_t is None else max(0.0, min(0.5, t - self.prev_t))
+        self.prev_t = t
+        m = self.model
+        ft = self.fire_tgt
+        # our gun shots = ammo spent (only shots at mechs teach accuracy)
+        gun = self._weapon("gun")
+        if gun is not None:
+            ammo = gun.get("ammo")
+            if ammo is not None and self.prev_ammo is not None and ammo < self.prev_ammo and ft and ft[0]:
+                m.on_shots("gun", ft[1], self.prev_ammo - ammo, t)
+            self.prev_ammo = ammo
+        else:
+            self.prev_ammo = None
+        laser = self._weapon("laser")
+        ch = (laser.get("charge") or 0.0) if laser else 0.0
+        if laser is not None and self.prev_charge > 0 and ch <= 0 and (laser.get("cooldown") or 0) > 0.3 and ft and ft[0]:
+            m.on_shots("laser", ft[1], 1, t)
+        self.prev_charge = ch
+        if ft and ft[0]:
+            m.on_fight_time("duel" if ft[2] else "hunt", ft[1], dt)
+        for ev in obs.get("events") or []:
+            ty = ev.get("type")
+            if ty == "hit" and ev.get("target") is not None and ev.get("target") < 100:
+                m.on_hit(ev.get("weapon"), t)
+            elif ty == "damaged" and ev.get("by") is not None and ev.get("by") < 100:
+                tr = self.tracks.get(ev["by"])
+                if tr is not None:
+                    d = d2(tr.pos, self.pos)
+                    mult = 1.0 + self.c("cubes.damage_per_cube", 0.04) * min(tr.cubes, self.c("cubes.stat_cap", 10))
+                    if ev.get("rear"):
+                        mult *= self.c("mech.rear_mult", 1.5)
+                    m.on_damage(ev.get("weapon"), d, ev.get("amount", 0.0), mult)
+        # how many enemies shoot at us at once while we duel, and stray fire while we hunt
+        shooters = [e for e in (getattr(self, "threats", []) or []) if e["los"] and e["age"] < 0.6 and e["tr"].hostile]
+        if ft and ft[0] and ft[2]:
+            m.on_shooters(len(shooters), dt)
+        if self.intent == "HUNT":
+            dmg_now = sum(ev.get("amount", 0.0) for ev in (obs.get("events") or []) if ev.get("type") == "damaged")
+            m.on_hunt_exposure(dt, dmg_now)
+        for ev in obs.get("events") or []:
+            if ev.get("type") == "kill":
+                m.on_kill(not self.last_kill_hostile.get(ev.get("target"), False))
+        # exposure: enemies that can shoot us right now
+        for e in getattr(self, "threats", []) or []:
+            if e["age"] > 0.6 or not e["los"]:
+                continue
+            tr = e["tr"]
+            if not (tr.hostile or (self.mode == "ffa" and self._aiming_at_us(tr))):
+                continue
+            m.on_exposure(tr.weapons, e["d"], dt)
+
+    def _aiming_at_us(self, tr):
+        if not tr.aim:
+            return False
+        bto = math.atan2(self.pos[1] - tr.pos[1], self.pos[0] - tr.pos[0])
+        return abs(angn(tr.aim[0] - bto)) < 0.35
 
     # ================================================================ mode
     def _update_mode(self, obs):
@@ -592,28 +664,20 @@ class Brain:
             return (stats.get("damage", 200) * 0.25 + stats.get("splash", 160) * 0.35) / stats.get("cooldown", 2.6)
         return 0.0
 
+    def our_mult(self):
+        cap = self.c("cubes.stat_cap", 10)
+        return 1.0 + self.c("cubes.damage_per_cube", 0.04) * min(self.my_cubes, cap)
+
     def our_dps(self, d, tgt_speed=8.0, los=True):
         if not los:
             return 0.0
-        tot = 0.0
-        for w in self.weapons:
-            if not w:
-                continue
-            k = w.get("kind")
-            tot += self.dps_kind(k, d, w.get("stats") or {}, self.energy, tgt_speed)
-        cap = self.c("cubes.stat_cap", 10)
-        return tot * (1.0 + self.c("cubes.damage_per_cube", 0.04) * min(self.my_cubes, cap))
+        return self.model.our_dps(self.weapons, d, self.our_mult(), self.energy)
 
     def enemy_dps(self, tr, d):
-        tot = 0.0
-        myspd = math.hypot(self.vel[0], self.vel[1])
-        for k in tr.weapons:
-            st = cget(self.cfg, "weapons." + k, {})
-            tot += self.dps_kind(k, d, st, 100.0, max(4.0, myspd), us=False)
         cap = self.c("cubes.stat_cap", 10)
-        tot *= (1.0 + self.c("cubes.damage_per_cube", 0.04) * min(tr.cubes, cap))
+        mult = 1.0 + self.c("cubes.damage_per_cube", 0.04) * min(tr.cubes, cap)
         armor = self.stats.get("armor", 0.0) or 0.0
-        return tot * 0.8 * (1.0 - min(0.6, armor))
+        return self.model.enemy_dps(tr.weapons, d, mult, armor)
 
     def _threats(self):
         out = []
@@ -782,21 +846,41 @@ class Brain:
         ret_adv = FFA_RET_ADV if ffa else RET_ADV
         regen_hp = FFA_REGEN_HP if ffa else REGEN_HP
 
-        # ---- retreat hysteresis
+        # ---- fight or flee: project the exchange with everyone who can shoot us now
+        engaged = [e for e in hostile if (e["los"] or e["d"] < 60) and e["age"] < 3.0]
+        proj = None
+        inc_now = 0.0
+        if engaged:
+            foes = []
+            for e in engaged:
+                tr_e = e["tr"]
+                spd_e = math.hypot(tr_e.vel[0], tr_e.vel[1])
+                od = self.our_dps(e["d"], spd_e, True)
+                ttk = tr_e.hp / max(od, 1.0) + (0.0 if e["los"] else 2.0)
+                foes.append((ttk, e["dps"]))
+                inc_now += e["dps"]
+            proj = CombatModel.project(self.hp, foes) + (len(foes),)
+        self.proj = proj
+        safety = (0.25 if ffa else 0.06) * self.max_hp
         if self.retreating:
-            if hp_frac > 0.85 or not hostile or (target is not None and adv > 2.5 and hp_frac > 0.55):
+            if not engaged or hp_frac > 0.9 or (proj is not None and proj[0] >= proj[3] and proj[1] > safety * 2):
                 self.retreating = False
-        elif hostile:
-            n_los = len([e for e in hostile if e["los"]])
-            ttk_t = 99.0
-            if target is not None:
-                ttk_t = target["tr"].hp / max(self.our_dps(target["d"], 8.0, True), 1.0)
-            others = len(hostile) - (1 if target is not None and target["hostile"] else 0)
-            finishing = ttk_t < 2.0 and hp_frac > 0.25
-            if not finishing and ((hp_frac < ret_hp and adv < 1.8) or (adv < ret_adv and hp_frac < 0.85)
-                                  or (recent_dmg > 0.3 * self.max_hp and adv < 1.3)
-                                  or (n_los >= 2 and adv < 1.4)):
-                self.retreating = True
+        elif proj is not None:
+            kills_p, hp_left, t_p, n_p = proj
+            # value everything in kills: HP is worth kappa kills per point (measured loadout model)
+            kappa = self._kills_per_hp()
+            if ffa:
+                kappa *= 1.5   # in a free-for-all, staying alive is the score itself
+            fight_val = kills_p + hp_left * kappa
+            if kills_p < n_p:
+                cv = self._find_cover(hostile)
+                if cv is not None:
+                    spd = self.stats.get("boost_speed", 19.5) if self.energy > 30 else self.stats.get("walk_speed", 11.7)
+                    t_c = d2(cv, pos) / max(spd, 1.0)
+                    cost = inc_now * t_c * 0.7
+                    flee_val = max(0.0, self.hp - cost) * kappa * 0.85   # chased retreats do not always work
+                    if cost < self.hp * 0.85 and flee_val > fight_val + 0.3:
+                        self.retreating = True
 
         # ---- zone emergency
         if urg >= 2.6 and zpt is not None:
@@ -805,8 +889,7 @@ class Brain:
 
         if self.retreating and hostile:
             cv = self._find_cover(hostile)
-            exposed = any(e["los"] for e in hostile)
-            if cv is not None and (d2(cv, pos) < 35.0 or not exposed):
+            if cv is not None:
                 self.intent = "RETREAT"
                 return cv, "retreat"
             if target is not None:
@@ -831,7 +914,7 @@ class Brain:
 
         # ---- regenerate after a fight before starting anything new
         in_combat = t - self.last_combat_t < 4.0
-        if hp_frac < regen_hp and not hostile_los:
+        if self.hp < self._hp_needed(hostile, ffa) and not hostile_los:
             cv = self._regen_spot(hostile or near)
             self.intent = "REGEN"
             # grab very close cubes on the way
@@ -956,6 +1039,30 @@ class Brain:
             out.append((gp, len(grp)))
         return out
 
+    def _kills_per_hp(self):
+        held = self._held()
+        stats = {w.get("kind"): (w.get("stats") or {}) for w in self.weapons if w}
+        return self.model.loadout_value(held, stats, self.our_mult(), self._enemy_kinds_seen())
+
+    def _hp_needed(self, hostile, ffa):
+        """HP we want before starting anything new: enough to win a duel against a typical hunter."""
+        m = self.model
+        best = None
+        for bd in (35.0, 52.0, 90.0, 135.0):
+            ours = self.our_dps(bd, 8.0, True)
+            theirs = m.rate("gun", bd) + 0.5 * m.rate("laser", bd)
+            if ours <= 1.0:
+                continue
+            cost = theirs * (1400.0 / ours)
+            if best is None or cost < best:
+                best = cost
+        if best is None:
+            return 0.6 * self.max_hp
+        need = best * self.model.shooters_avg()
+        if ffa:
+            need *= 1.6
+        return min(0.9 * self.max_hp, max(0.15 * self.max_hp, need))
+
     def _nearest_cube(self, rmax):
         best = None
         for cid, (p, ts) in self.cubes_seen.items():
@@ -974,22 +1081,47 @@ class Brain:
         return [self.pos[0], self.pos[1], self.pos[2]]
 
     # ---------------------------------------------------------------- loot
+    def _enemy_kinds_seen(self):
+        kinds = []
+        for tr in self.tracks.values():
+            if tr.hostile or self.mode == "ffa":
+                kinds.extend(tr.weapons)
+        return kinds or ["gun"]
+
+    def _loadout_value(self, kinds):
+        stats = {}
+        for w in self.weapons:
+            if w:
+                stats[w.get("kind")] = w.get("stats") or {}
+        v = self.model.loadout_value(kinds, stats, self.our_mult(), self._enemy_kinds_seen())
+        # carrying a mortar makes enemy lasers hit 60% harder (cook-off)
+        if "mortar" in kinds:
+            ek = self._enemy_kinds_seen()
+            laser_share = ek.count("laser") / max(len(ek), 1)
+            v *= 1.0 - 0.3 * laser_share
+        return v
+
     def _loadout_gain(self, kind):
+        """Relative improvement in expected damage throughput if we take this weapon."""
         held = self._held()
         if kind in held:
             return 0.0, None
-        cur = sum(WVAL.get(k, 0.5) for k in held)
+        cur = self._loadout_value(held)
         slots = [w.get("kind") if w else None for w in self.weapons]
         if None in slots:
-            return WVAL.get(kind, 0.5), None
-        # swap out the weakest
-        wi = min(range(len(slots)), key=lambda i: WVAL.get(slots[i], 0.5))
-        new = cur - WVAL.get(slots[wi], 0.5) + WVAL.get(kind, 0.5)
-        # never drop a charging laser
-        w = self.weapons[wi]
-        if w and w.get("kind") == "laser" and (w.get("charge") or 0) > 0:
-            return 0.0, None
-        return new - cur, wi
+            new = self._loadout_value(held + [kind])
+            return (new - cur) / max(cur, 1e-9), None
+        best = (0.0, None)
+        for wi, k in enumerate(slots):
+            w = self.weapons[wi]
+            if w and w.get("kind") == "laser" and (w.get("charge") or 0) > 0:
+                continue  # never drop a charging laser
+            rest = [x for j, x in enumerate(slots) if j != wi]
+            new = self._loadout_value(rest + [kind])
+            g = (new - cur) / max(cur, 1e-9)
+            if g > best[0]:
+                best = (g, wi)
+        return best
 
     def _loot_goal(self, near, urg):
         t = self.t
@@ -1030,8 +1162,8 @@ class Brain:
 
         for pid, (kind, p, ts) in self.pickups.items():
             gain, _ = self._loadout_gain(kind)
-            if gain > 0.2:
-                consider(p, 12.0 * gain, "pick")
+            if gain > 0.06:
+                consider(p, 40.0 * min(gain, 1.0), "pick")
         for cp, cnt in self._cube_clusters():
             if abs(cp[2] - pos[2]) > 6 and d2(cp, pos) < 8:
                 continue
@@ -1569,7 +1701,7 @@ class Brain:
             if dh > rad - 0.3 or abs(pp[2] - self.pos[2]) > 3.8:
                 continue
             gain, drop = self._loadout_gain(p.get("kind"))
-            if gain <= 0.2:
+            if gain <= 0.06:
                 continue
             # do not swap while an enemy is close and we would lose our only gun
             if drop is not None and any(e["d"] < 60 and e["age"] < 1 for e in self.threats):
@@ -1620,6 +1752,7 @@ class Brain:
             tgt = self._farm_target()
 
         if tgt is None:
+            self.fire_tgt = None
             aim = self._idle_aim()
             # ambush: pre-charge the laser while a known hunter is close but out of sight
             lurking = any(e["hostile"] and e["age"] < 6.0 and e["d"] < 140 for e in threats)
@@ -1740,6 +1873,11 @@ class Brain:
             st = gun.get("stats") or {}
             if gun.get("reload", 0) == 0 and gun.get("ammo", 12) < 3 and not los:
                 reload = True
+        if tgt["kind"] == "mech" and los:
+            hostile_t = bool(target is not None and target.get("hostile"))
+            self.fire_tgt = (True, d, hostile_t)
+        else:
+            self.fire_tgt = None
         pmin = self.c("mech.min_pitch", -0.7)
         pmax = self.c("mech.max_pitch", 1.3)
         return (yaw, max(pmin, min(pmax, pitch))), fire, reload
@@ -1901,40 +2039,74 @@ class Brain:
 
     # ================================================================ upgrades
     def _choose_upgrade(self, offer):
+        """Pick the upgrade that raises (our damage output x our effective HP) the most.
+
+        A fight's margin scales with the product of how fast we kill and how long we last,
+        so every upgrade is scored by its relative effect on that product, using this
+        match's measured hit rates for the weapon shares.
+        """
         held = self._held()
         taken = {}
         for u in self.me.get("upgrades") or []:
             k = u if isinstance(u, str) else (u.get("id") if isinstance(u, dict) else str(u))
             taken[k] = taken.get(k, 0) + 1
+        # each weapon's share of our damage, over the fights we actually have
+        m = self.model
+        hs = m.mode_share()
         share = {"gun": 0.0, "laser": 0.0, "lightning": 0.0, "mortar": 0.0}
         tot = 0.0
-        for k in held:
-            share[k] = WVAL.get(k, 0.5)
-            tot += share[k]
+        for w in self.weapons:
+            if not w:
+                continue
+            k = w.get("kind")
+            st = w.get("stats") or {}
+            v = 0.0
+            for dist, wt in ((22.0, hs), (90.0, 1.0 - hs)):
+                if m.in_range(k, dist, st):
+                    v += wt * m.base_dps(k, st) * m.hit_p(k, dist)
+            share[k] = v
+            tot += v
         for k in share:
-            share[k] = share[k] / tot if tot else 0.0
-        # with only the starting gun we will probably swap it later: weapon upgrades are worth less
-        wscale = 0.6 if len(held) < 2 else 1.0
+            share[k] = share[k] / tot if tot > 0 else 0.0
+        armor = self.stats.get("armor", 0.0) or 0.0
+        ffa = self.mode == "ffa"
+        ehp_w = 1.3 if ffa else 1.0
+        st_gun = (self._weapon("gun") or {}).get("stats") or self.c("weapons.gun", {})
+        mag, cd, rl = st_gun.get("mag", 12), st_gun.get("cooldown", 0.24), st_gun.get("reload", 2.4)
+        sus0 = (mag * cd) / (mag * cd + rl)
+        sus_mag = ((mag + 8) * cd) / ((mag + 8) * cd + rl * 0.8)
+        cdr = cd * 0.87
+        sus_rate = (mag * cdr) / (mag * cdr + rl)
         base = {
-            "plating": 18, "armor": 15, "nanites": 10, "gyros": 5, "servos": 5, "sensors": 3,
-            "capacitor": 3 + 6 * share["lightning"], "reactor": 3 + 6 * share["lightning"], "jets": 2,
-            "laser_damage": 16 * share["laser"] * wscale, "laser_charge": 10 * share["laser"] * wscale,
-            "laser_pierce": 2 * share["laser"],
-            "gun_damage": 12 * share["gun"] * wscale, "gun_rate": 12 * share["gun"] * wscale,
-            "gun_mag": 6 * share["gun"] * wscale, "gun_velocity": 6 * share["gun"] * wscale,
-            "lightning_efficiency": 13 * share["lightning"] * wscale, "lightning_range": 9 * share["lightning"] * wscale,
-            "lightning_chain": 3 * share["lightning"],
-            "mortar_splash": 3 * share["mortar"], "mortar_reload": 4 * share["mortar"],
-            "mortar_velocity": 2 * share["mortar"],
+            "plating": 0.15 * ehp_w,
+            "armor": ((1 - armor) / max(0.05, 1 - armor - 0.08) - 1.0) * ehp_w,
+            "nanites": 0.06 * ehp_w,
+            "gyros": 0.03, "servos": 0.03, "sensors": 0.02, "jets": 0.01,
+            "capacitor": 0.02 + 0.08 * share["lightning"], "reactor": 0.02 + 0.08 * share["lightning"],
+            "laser_damage": 0.18 * share["laser"],
+            "laser_charge": 0.085 * share["laser"],
+            "laser_pierce": 0.01 * share["laser"],
+            "gun_damage": 0.15 * share["gun"],
+            "gun_rate": ((sus_rate / cdr) / (sus0 / cd) - 1.0) * share["gun"],
+            "gun_mag": (sus_mag / sus0 - 1.0) * share["gun"],
+            "gun_velocity": 0.05 * share["gun"],
+            "lightning_efficiency": 0.12 * share["lightning"],
+            "lightning_range": 0.05 * share["lightning"],
+            "lightning_chain": 0.02 * share["lightning"],
+            "mortar_splash": 0.05 * share["mortar"], "mortar_reload": 0.18 * share["mortar"],
+            "mortar_velocity": 0.03 * share["mortar"],
         }
-        if UPG_STYLE == "dps":
-            for k in ("laser_damage", "laser_charge", "gun_damage", "gun_rate", "lightning_efficiency", "lightning_range"):
-                base[k] = base.get(k, 0) * 1.8
+        # we may still swap the starting gun away: discount upgrades for weapons we might drop
+        if len(held) < 2:
+            for k in list(base):
+                if k.startswith("gun_"):
+                    base[k] *= 0.7
         best_i, best_s = 0, -1e9
         for i, ch in enumerate(offer.get("choices") or []):
             cid = ch.get("id", "")
-            s = base.get(cid, 2.0)
-            s *= 0.88 ** taken.get(cid, 0)
+            s = base.get(cid, 0.01)
+            if cid == "plating":
+                s *= 0.97 ** taken.get(cid, 0)
             if s > best_s:
                 best_i, best_s = i, s
         return best_i
