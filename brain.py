@@ -16,6 +16,7 @@ Layers:
   6. gunnery         lead aim, per-weapon fire control, laser charge timing
 """
 import math
+import os
 import random
 import time
 
@@ -23,10 +24,11 @@ from mechio import log
 
 TAU = 2.0 * math.pi
 # aggression knobs
-RET_HP = 0.22
-RET_ADV = 0.45
-REGEN_HP = 0.45
-FFA_THRESHOLD = 8.0
+RET_HP = 0.12
+RET_ADV = 0.3
+REGEN_HP = 0.3
+FFA_THRESHOLD = 12.0
+FFA_STYLE = os.environ.get("FFA_STYLE", "survivor")   # opportunist | survivor | aggressor
 # free-for-all knobs (placement matters, everyone shoots)
 FFA_RET_HP = 0.4
 FFA_RET_ADV = 0.9
@@ -510,13 +512,14 @@ class Brain:
                 continue
             if prev[0] - hp > 40 and t - self.hit_by_us.get(mid, -99) > 0.5:
                 near_npc = any(d2(n["pos"], m["pos"]) < 60 for n in npcs)
-                if not near_npc:
+                if not near_npc and self.ffa_kinds.get("hpdrop", 0) < 3:
                     ev += 1.0
                 self.ffa_kinds['hpdrop'] = self.ffa_kinds.get('hpdrop', 0) + 1
         self.ffa_evidence += ev
         if ev > 0:
             self.ffa_log.append((round(t, 1), ev))
-        if self.ffa_evidence >= FFA_THRESHOLD:
+        kinds = sum(1 for k, v in self.ffa_kinds.items() if v > 0)
+        if (self.ffa_evidence >= FFA_THRESHOLD and kinds >= 2) or self.ffa_evidence >= 20.0:
             self.mode = "ffa"
             log("mode -> ffa at t=%.1f" % t)
 
@@ -824,10 +827,19 @@ class Brain:
                 return None, "hunt"
             # free-for-all: only take fights we are likely to win (weak or busy targets)
             tr = target["tr"]
-            weak = tr.hp < 0.5 * tr.max_hp or self._distracted(tr)
-            if (weak and adv > 1.2 and hp_frac > 0.5) or adv > 2.5:
-                self.intent = "FIGHT"
-                return None, "fight"
+            if FFA_STYLE == "aggressor":
+                self.intent = "HUNT"
+                return None, "hunt"
+            if FFA_STYLE == "survivor":
+                finish = tr.hp < 0.3 * tr.max_hp and target["d"] < 90 and hp_frac > 0.6
+                if finish:
+                    self.intent = "FIGHT"
+                    return None, "fight"
+            else:
+                weak = tr.hp < 0.5 * tr.max_hp or self._distracted(tr)
+                if (weak and adv > 1.2 and hp_frac > 0.5) or adv > 2.5:
+                    self.intent = "FIGHT"
+                    return None, "fight"
 
         # look for prey: remembered passive mechs
         prey = None
@@ -1476,6 +1488,9 @@ class Brain:
         # choose what to shoot: enemy target, else npc/crate when farming
         tgt = None
         if (self.intent == "REGEN" or self.t < 2.6) and target is not None and not target["hostile"]:
+            target = None
+        if self.mode == "ffa" and FFA_STYLE == "survivor" and target is not None and not target["hostile"] \
+                and self.intent != "FIGHT":
             target = None
         if target is not None and target["age"] < 1.0:
             tr = target["tr"]
