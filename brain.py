@@ -59,8 +59,10 @@ PEEK = int(os.environ.get("PEEK", "0"))
 BLITZ = int(os.environ.get("BLITZ", "0"))
 PF_W = float(os.environ.get("PF_W", "1.0"))
 LOOT_PLUS = int(os.environ.get("LOOT_PLUS", "0"))
-CANOPY = os.environ.get("CANOPY", "1") == "1"   # tree crowns block sight (vision config canopy_blocks)
+CANOPY = os.environ.get("CANOPY", "0") == "1"   # tree crowns block sight (vision config canopy_blocks)
 LIGHT_FIRST = int(os.environ.get("LIGHT_FIRST", "0"))
+AGGRO = int(os.environ.get("AGGRO", "1"))
+AGGRO_QUIET = float(os.environ.get("AGGRO_QUIET", "6"))
 PEEK_R = float(os.environ.get("PEEK_R", "14"))
 TEMPO_HP = float(os.environ.get("TEMPO_HP", "0.85"))
 TEMPO_QUIET = float(os.environ.get("TEMPO_QUIET", "8"))
@@ -842,6 +844,10 @@ class Brain:
             proj = CombatModel.project(self.hp, foes) + (len(foes),)
         self.proj = proj
         safety = (0.25 if ffa else 0.06) * self.max_hp
+        if AGGRO and not ffa:
+            # the practice squad never loses track of us: hiding only hands them time
+            self.retreating = False
+            proj = None
         if self.retreating:
             if not engaged or hp_frac > 0.9 or (proj is not None and proj[0] >= proj[3] and proj[1] > safety * 2):
                 self.retreating = False
@@ -894,7 +900,10 @@ class Brain:
 
         # ---- regenerate after a fight before starting anything new
         in_combat = t - self.last_combat_t < 4.0
-        if self.hp < self._hp_needed(hostile, ffa) and not hostile_los:
+        quiet = True
+        if AGGRO and not ffa:
+            quiet = not any(tr.hostile and t - tr.t_seen < AGGRO_QUIET for tr in self.tracks.values())
+        if self.hp < self._hp_needed(hostile, ffa) and not hostile_los and quiet:
             cv = self._regen_spot(hostile or near)
             self.intent = "REGEN"
             # grab very close cubes on the way
