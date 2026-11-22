@@ -114,6 +114,8 @@ class Brain:
         self.retreating = False
         self.cover = None
         self.cover_t = -99.0
+        self.fight_cover = None
+        self.fight_cover_t = -99.0
         self.strafe_sign = 1
         self.strafe_until = 0.0
         self.path_goal = None
@@ -579,9 +581,15 @@ class Brain:
                 self.retreating = False
         elif hostile:
             n_los = len([e for e in hostile if e["los"]])
-            if (hp_frac < 0.35 and adv < 1.8) or (adv < 0.8 and hp_frac < 0.85) \
-                    or (recent_dmg > 0.3 * self.max_hp and adv < 1.3) \
-                    or (n_los >= 2 and adv < 1.4):
+            ttk_t = 99.0
+            if target is not None:
+                ttk_t = target["tr"].hp / max(self.our_dps(target["d"], 8.0, True), 1.0)
+            others = len(hostile) - (1 if target is not None and target["hostile"] else 0)
+            finishing = ttk_t < 2.0 and hp_frac > 0.25
+            if not finishing and ((hp_frac < 0.35 and adv < 1.8) or (adv < 0.8 and hp_frac < 0.85)
+                                  or (recent_dmg > 0.3 * self.max_hp and adv < 1.3)
+                                  or (n_los >= 2 and adv < 2.5)
+                                  or (hp_frac < 0.5 and others >= 1)):
                 self.retreating = True
 
         # ---- zone emergency
@@ -591,10 +599,12 @@ class Brain:
 
         if self.retreating and hostile:
             cv = self._find_cover(hostile)
-            if cv is not None:
+            exposed = any(e["los"] for e in hostile)
+            if cv is not None and (d2(cv, pos) < 35.0 or not exposed):
                 self.intent = "RETREAT"
-                return cv, "fast"
+                return cv, "retreat"
             if target is not None:
+                # cover too far to reach under fire: fight back instead of running
                 self.intent = "FIGHT"
                 return None, "fight"
 
@@ -609,7 +619,7 @@ class Brain:
 
         # ---- regenerate after a fight before starting anything new
         in_combat = t - self.last_combat_t < 4.0
-        if hp_frac < 0.7 and not hostile_los:
+        if (hp_frac < 0.7 or (hp_frac < 0.85 and hostile)) and not hostile_los:
             cv = self._regen_spot(hostile or near)
             self.intent = "REGEN"
             # grab very close cubes on the way
@@ -625,7 +635,7 @@ class Brain:
             return g, "fast"
 
         # ---- passive targets: free kills, go close
-        if target is not None and not target["hostile"]:
+        if target is not None and not target["hostile"] and t >= 2.6:
             self.intent = "HUNT"
             return None, "hunt"
 
@@ -904,6 +914,22 @@ class Brain:
             boost = False
         elif style == "stop":
             mv, speed = (0.0, 0.0), 0.0
+        elif style == "retreat" and goal is not None:
+            mv = self._steer_to(goal)
+            dist = d2(goal, pos)
+            exposed = any(e["los"] and e["hostile"] for e in threats)
+            if exposed and dist > 4.0:
+                if t > self.strafe_until:
+                    self.strafe_sign = -self.strafe_sign
+                    self.strafe_until = t + self.rng.uniform(0.35, 0.8)
+                perp = (-mv[1] * self.strafe_sign, mv[0] * self.strafe_sign)
+                cand = unit((mv[0] + perp[0] * 0.7, mv[1] + perp[1] * 0.7))
+                if self.world is None or self.world.walkable(pos[0] + cand[0] * 5, pos[1] + cand[1] * 5):
+                    mv = cand
+            if dist < 2.0:
+                speed = 0.0
+            elif dist > 12 and self.energy > energy_reserve + 10:
+                boost = True
         elif goal is not None:
             mv = self._steer_to(goal)
             dist = d2(goal, pos)
@@ -987,6 +1013,27 @@ class Brain:
                 ahead = (pos[0] + mv[0] * 6, pos[1] + mv[1] * 6)
                 if not self.world.walkable(ahead[0], ahead[1]):
                     mv = self._steer_to(tr.pos) if radial >= 0 else (-to[0], -to[1])
+        # stay close to cover from the other hunters while fighting this one
+        others = [e for e in threats if e["hostile"] and e["tr"].id != tr.id and e["age"] < 8.0 and e["d"] < 260]
+        anc = None
+        if others:
+            if self.t - self.fight_cover_t > 0.6:
+                self.fight_cover = self._find_cover(others)
+                self.fight_cover_t = self.t
+            anc = self.fight_cover
+            wgt = 1.4
+        else:
+            if self.t - self.fight_cover_t > 1.5 and self.world is not None:
+                a = self.world.anchors_near(pos[0], pos[1], 35.0)
+                self.fight_cover = [a[0][1], a[0][2], 0.0] if a else None
+                self.fight_cover_t = self.t
+            anc = self.fight_cover
+            wgt = 0.5
+        if anc is not None:
+            da = d2(anc, pos)
+            if 4.0 < da < 60.0:
+                av = unit((anc[0] - pos[0], anc[1] - pos[1]))
+                mv = (mv[0] + av[0] * wgt, mv[1] + av[1] * wgt)
         # drift through nearby cubes while fighting
         cu = self._nearest_cube(22.0)
         if cu is not None:
@@ -1167,14 +1214,14 @@ class Brain:
 
         # choose what to shoot: enemy target, else npc/crate when farming
         tgt = None
-        if self.intent == "REGEN" and target is not None and not target["hostile"]:
+        if (self.intent == "REGEN" or self.t < 2.6) and target is not None and not target["hostile"]:
             target = None
         if target is not None and target["age"] < 1.0:
             tr = target["tr"]
             sc = target["scale"]
             tgt = {"pos": tr.pred(self.t, 0.3), "vel": tr.vel, "h": 4.5 * sc, "r": 2.5 * sc,
                    "kind": "mech", "d": target["d"], "id": tr.id, "airborne": abs(tr.vel[2]) > 0.5}
-        elif self.intent != "REGEN":
+        elif self.intent != "REGEN" and self.t >= 2.6:
             tgt = self._farm_target()
 
         if tgt is None:
@@ -1405,6 +1452,10 @@ class Brain:
     def _idle_aim(self):
         t = self.t
         pos = self.pos
+        if t < 2.6:
+            # opening look-around: find weapons, crates and drones before choosing a plan
+            cur = (self.me.get("aim") or [0.0, 0.0])[0]
+            return (angn(cur + 1.2), -0.08)
         # recently damaged from a direction we can't see: look there
         for ev in reversed(self.dmg_events):
             if t - ev[0] < 2.5 and ev[3] is not None:
