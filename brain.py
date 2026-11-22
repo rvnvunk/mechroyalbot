@@ -814,11 +814,16 @@ class Brain:
                 return cu, "fast"
             return cv, ("fast" if cv is not None and d2(cv, pos) > 4 else "stop")
 
-        # ---- loot: weapons and cubes first
+        # ---- loot first only when it is close (or a real weapon upgrade / supply drop)
         g = self._loot_goal(near, urg)
         if g is not None and self.loot_kind in ("pick", "cube", "drop"):
-            self.intent = "LOOT"
-            return g, "fast"
+            gd = d2(g, pos)
+            urgent_loot = (self.loot_kind == "drop" or (self.loot_kind == "pick" and gd < 120)
+                           or (self.loot_kind == "cube" and gd < 35)
+                           or target is None or target["hostile"] or ffa)
+            if urgent_loot:
+                self.intent = "LOOT"
+                return g, "fast"
 
         # ---- passive targets: free kills, go close (practice squad only)
         if target is not None and not target["hostile"] and t >= 2.6:
@@ -857,7 +862,7 @@ class Brain:
             if not near_farm and self.loot_kind not in ("npc", "crate") or g is not None and d2(g, pos) > 30.0:
                 self.intent = "PROWL"
                 return prey["pos"], "fast"
-        if g is not None or self.loot_kind in ("npc", "crate"):
+        if g is not None or self.loot_kind in ("npc", "crate", "cube", "pick"):
             self.intent = "LOOT"
             return g, ("fast" if g is not None else "stop")
         if urg > 0.5 and zpt is not None:
