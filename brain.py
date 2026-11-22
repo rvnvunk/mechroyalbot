@@ -22,6 +22,10 @@ import time
 from mechio import log
 
 TAU = 2.0 * math.pi
+# aggression knobs
+RET_HP = 0.35
+RET_ADV = 0.8
+REGEN_HP = 0.7
 WVAL = {"laser": 1.7, "lightning": 1.5, "gun": 1.0, "mortar": 0.55}
 
 
@@ -116,6 +120,9 @@ class Brain:
         self.cover_t = -99.0
         self.fight_cover = None
         self.fight_cover_t = -99.0
+        self.range_d = 90.0
+        self.range_t = -99.0
+        self.range_for = None
         self.strafe_sign = 1
         self.strafe_until = 0.0
         self.path_goal = None
@@ -382,11 +389,12 @@ class Brain:
             cd = stats.get("cooldown", 0.24)
             rl = stats.get("reload", 2.4)
             sustain = (mag * cd) / (mag * cd + rl)
-            spd = stats.get("speed", 252)
-            # bullet flight time vs target juking
-            fl = d / max(spd, 1.0)
-            hit = 0.95 - 0.55 * min(1.0, (d / 200.0)) - 0.25 * min(1.0, fl * mover / 6.0)
-            hit = max(0.15, min(0.95, hit))
+            if us:
+                # our lead aim against strafing targets
+                hit = 0.9 if d <= 100 else max(0.45, 0.9 - (d - 100) * 0.0035)
+            else:
+                # their bullets against our random strafing: falls off fast with flight time
+                hit = 0.85 * math.exp(-d / 60.0)
             return stats.get("damage", 45) / cd * sustain * hit
         if kind == "laser":
             if d > stats.get("range", 280):
@@ -586,10 +594,9 @@ class Brain:
                 ttk_t = target["tr"].hp / max(self.our_dps(target["d"], 8.0, True), 1.0)
             others = len(hostile) - (1 if target is not None and target["hostile"] else 0)
             finishing = ttk_t < 2.0 and hp_frac > 0.25
-            if not finishing and ((hp_frac < 0.35 and adv < 1.8) or (adv < 0.8 and hp_frac < 0.85)
+            if not finishing and ((hp_frac < RET_HP and adv < 1.8) or (adv < RET_ADV and hp_frac < 0.85)
                                   or (recent_dmg > 0.3 * self.max_hp and adv < 1.3)
-                                  or (n_los >= 2 and adv < 2.5)
-                                  or (hp_frac < 0.5 and others >= 1)):
+                                  or (n_los >= 2 and adv < 1.4)):
                 self.retreating = True
 
         # ---- zone emergency
@@ -619,7 +626,7 @@ class Brain:
 
         # ---- regenerate after a fight before starting anything new
         in_combat = t - self.last_combat_t < 4.0
-        if (hp_frac < 0.7 or (hp_frac < 0.85 and hostile)) and not hostile_los:
+        if hp_frac < REGEN_HP and not hostile_los:
             cv = self._regen_spot(hostile or near)
             self.intent = "REGEN"
             # grab very close cubes on the way
@@ -977,21 +984,11 @@ class Brain:
                 return self._steer_to(tr.pos), 1.0
             mv = (to[0] * radial + perp[0] * 0.5, to[1] * radial + perp[1] * 0.5)
             return unit(mv), 1.0
-        lo, hi = 70.0, 150.0
-        if "lightning" in held and self.energy > 25:
-            lo, hi = 8.0, 32.0
-            if "lightning" in their and "mortar" not in held:
-                lo, hi = 10.0, 30.0
-        elif "laser" in held:
-            lo, hi = 60.0, 160.0
-        else:
-            lo, hi = 35.0, 110.0
-        if "lightning" in their and "lightning" not in held:
-            lo = max(lo, 55.0)
-            hi = max(hi, lo + 40)
+        best_d = self._best_range(tr, threats)
+        lo, hi = best_d - 18.0, best_d + 18.0
         # weak target and we are healthy: close in to finish
-        if tr.hp < 300 and self.hp > 0.5 * self.max_hp:
-            hi = min(hi, 90.0)
+        if tr.hp < 250 and self.hp > 0.5 * self.max_hp:
+            hi = min(hi, max(lo + 10, 90.0))
         to = unit((tr.pos[0] - pos[0], tr.pos[1] - pos[1]))
         radial = 0.0
         if d > hi:
@@ -1048,6 +1045,30 @@ class Brain:
         if not target.get("myl", True) and d < 120 and self.hp > 0.45 * self.max_hp:
             mv = self._steer_to(tr.pos)
         return unit(mv), 1.0
+
+    def _best_range(self, tr, threats):
+        """Distance where our expected DPS beats theirs by the widest margin."""
+        if self.t - self.range_t < 0.5 and self.range_for == tr.id:
+            return self.range_d
+        spd = math.hypot(tr.vel[0], tr.vel[1])
+        others = 0.0
+        for e in threats:
+            if e["hostile"] and e["tr"].id != tr.id and (e["los"] or e["d"] < 60):
+                others += e["dps"]
+        best = None
+        for d in (20.0, 32.0, 45.0, 60.0, 80.0, 100.0, 120.0, 140.0, 160.0, 185.0, 210.0):
+            ours = self.our_dps(d, spd, True)
+            if ours <= 1.0:
+                continue
+            theirs = self.enemy_dps(tr, d) + others
+            sc = ours / (theirs + 25.0)
+            # time to kill also matters a little: prefer faster kills when close to equal
+            sc *= (1.0 + 0.002 * ours)
+            if best is None or sc > best[0]:
+                best = (sc, d)
+        d = best[1] if best else 90.0
+        self.range_d, self.range_t, self.range_for = d, self.t, tr.id
+        return d
 
     def _steer_to(self, goal):
         pos = self.pos
@@ -1226,13 +1247,18 @@ class Brain:
 
         if tgt is None:
             aim = self._idle_aim()
-            # never hold a laser charge without a target for long
+            # ambush: pre-charge the laser while a known hunter is close but out of sight
+            lurking = any(e["hostile"] and e["age"] < 6.0 and e["d"] < 140 for e in threats)
             for i, w in enumerate(weapons):
                 if w and w.get("kind") == "laser":
+                    st = w.get("stats") or {}
                     ch = w.get("charge") or 0
-                    full = (w.get("stats") or {}).get("charge", 0.75)
-                    if 0 < ch < full * 3.0 and self.t - self.last_combat_t < 4.0:
-                        fire[i] = True  # keep charge briefly for a peek
+                    full = st.get("charge", 0.75)
+                    hold = st.get("hold_s", 2.0)
+                    if ch > 0 and ch < full + hold * 0.85 and (lurking or self.t - self.last_combat_t < 4.0):
+                        fire[i] = True  # keep the charge for the peek
+                    elif ch <= 0 and lurking and w.get("cooldown", 0) <= 0.05 and self.intent not in ("RETREAT", "ZONE"):
+                        fire[i] = True  # start charging
             gun = self._weapon("gun")
             if gun is not None:
                 st = gun.get("stats") or {}
