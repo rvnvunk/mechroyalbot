@@ -24,17 +24,26 @@ from mechio import log
 
 TAU = 2.0 * math.pi
 # aggression knobs
-RET_HP = 0.12
-RET_ADV = 0.3
-REGEN_HP = 0.3
+RET_HP = float(os.environ.get("RET_HP", "0.12"))
+RET_ADV = float(os.environ.get("RET_ADV", "0.3"))
+REGEN_HP = float(os.environ.get("REGEN_HP", "0.3"))
 FFA_THRESHOLD = 12.0
-FFA_STYLE = "survivor"
-PACIFIST = True   # opportunist | survivor | aggressor
+FFA_STYLE = os.environ.get("FFA_STYLE", "survivor")   # opportunist | survivor | aggressor
 # free-for-all knobs (placement matters, everyone shoots)
 FFA_RET_HP = 0.4
 FFA_RET_ADV = 0.9
 FFA_REGEN_HP = 0.75
-WVAL = {"laser": 1.7, "lightning": 1.5, "gun": 1.0, "mortar": 0.55}
+WVAL = {"laser": 1.7, "lightning": float(os.environ.get("W_LIGHT", "1.5")), "gun": 1.0, "mortar": 0.55}
+# experiment knobs (defaults = submitted behaviour)
+HUNT_WHEN_HOSTILE = os.environ.get("HUNT_WHEN_HOSTILE", "1") == "1"
+TRAVEL_BOOST = os.environ.get("TRAVEL_BOOST", "0") == "1"
+HUNT_HI = float(os.environ.get("HUNT_HI", "30"))
+UPG_STYLE = os.environ.get("UPG_STYLE", "ehp")
+FLANK = os.environ.get("FLANK", "1") == "1"
+NPC_FIRST = os.environ.get("NPC_FIRST", "0") == "1"
+FARM_EARLY = float(os.environ.get("FARM_EARLY", "0"))
+ISO = os.environ.get("ISO", "1") == "1"
+FIGHT_RANGE_SCALE = float(os.environ.get("FIGHT_RANGE_SCALE", "1.0"))
 
 
 def angn(a):
@@ -134,9 +143,10 @@ class Brain:
         self.pickups = {}
         self.cubes_seen = {}
         self.cube_bad = set()
+        self.npc_attackers = {}
         self.cube_near = {}
         # practice squad vs free-for-all detection
-        self.mode = "ffa"
+        self.mode = "practice"
         self.ffa_evidence = 0.0
         self.ffa_log = []
         self.ffa_kinds = {}
@@ -292,7 +302,7 @@ class Brain:
         # ---------------- gunnery
         aim, fire, reload = self._gunnery(target, threats)
         act["aim"] = [aim[0], aim[1]]
-        act["fire"] = [False, False] if PACIFIST else fire
+        act["fire"] = fire
         if reload:
             act["reload"] = True
         return act
@@ -342,6 +352,8 @@ class Brain:
             if ty == "damaged":
                 self.last_damaged_t = t
                 self.last_combat_t = t
+                if ev.get("weapon") == "npc" and ev.get("by") is not None:
+                    self.npc_attackers[ev["by"]] = t
                 self.dmg_events.append((t, ev.get("amount", 0), ev.get("by"), ev.get("bearing"), ev.get("weapon")))
                 by = ev.get("by")
                 if by is not None and by in self.tracks:
@@ -798,13 +810,8 @@ class Brain:
             self.intent = "CAPTURE"
             return cap, ("fast" if d2(cap, pos) > 3.0 else "stop")
 
-        if PACIFIST and near:
-            cv = self._find_cover(near)
-            if cv is not None:
-                self.intent = "RETREAT"
-                return cv, "retreat"
         # ---- hostile engagement
-        if not PACIFIST and target is not None and target["hostile"] and (target["d"] < 230 or t - target["tr"].last_hit_us < 3):
+        if target is not None and target["hostile"] and (target["d"] < 230 or t - target["tr"].last_hit_us < 3):
             self.intent = "FIGHT"
             return None, "fight"
 
@@ -835,8 +842,9 @@ class Brain:
                 return g, "fast"
 
         # ---- passive targets: free kills, go close (practice squad only)
-        if target is not None and not target["hostile"] and t >= 2.6:
-            if not ffa:
+        farm_window = t < FARM_EARLY and self.my_cubes < 6 and g is not None and target is not None and target["d"] > 60
+        if target is not None and not target["hostile"] and t >= 2.6 and not farm_window:
+            if not ffa and (HUNT_WHEN_HOSTILE or not hostile):
                 self.intent = "HUNT"
                 return None, "hunt"
             # free-for-all: only take fights we are likely to win (weak or busy targets)
@@ -845,7 +853,7 @@ class Brain:
                 self.intent = "HUNT"
                 return None, "hunt"
             if FFA_STYLE == "survivor":
-                finish = (not PACIFIST) and tr.hp < 0.3 * tr.max_hp and target["d"] < 90 and hp_frac > 0.6
+                finish = tr.hp < 0.3 * tr.max_hp and target["d"] < 90 and hp_frac > 0.6
                 if finish:
                     self.intent = "FIGHT"
                     return None, "fight"
@@ -1200,7 +1208,7 @@ class Brain:
             if style == "walk":
                 speed = 1.0
             if style == "fast" and dist > 25 and self.energy > energy_reserve + 20:
-                boost = self.intent in ("ZONE", "RETREAT")
+                boost = self.intent in ("ZONE", "RETREAT") or (TRAVEL_BOOST and self.intent in ("LOOT", "PROWL", "EXPLORE"))
             if dist < 2.0:
                 speed = 0.0
         else:
@@ -1230,27 +1238,27 @@ class Brain:
         their = tr.weapons
         if passive:
             # it is not shooting back: get close and behind it (rear hits deal x1.5)
-            lo, hi = 12.0, 28.0 if "lightning" in held else 30.0
+            lo, hi = 12.0, min(28.0, HUNT_HI) if "lightning" in held else HUNT_HI
             face = tr.aim[0] if tr.aim else 0.0
             back = (tr.pos[0] - math.cos(face) * (lo + hi) * 0.5, tr.pos[1] - math.sin(face) * (lo + hi) * 0.5)
             rel = math.atan2(pos[1] - tr.pos[1], pos[0] - tr.pos[0])
-            in_rear = abs(angn(rel - face)) > math.radians(105)
+            in_rear = abs(angn(rel - face)) > math.radians(105) or not FLANK
             if d > hi + 25 or not target.get("myl", True):
                 self.hunt_boost = d > 60 and self.energy > (70 if "lightning" in held else 35)
-                goal = back if (self.world is None or self.world.walkable(back[0], back[1])) else tr.pos
+                goal = back if (FLANK and (self.world is None or self.world.walkable(back[0], back[1]))) else tr.pos
                 return self._steer_to(goal), 1.0
-            if not in_rear and (self.world is None or self.world.walkable(back[0], back[1])):
+            if FLANK and not in_rear and (self.world is None or self.world.walkable(back[0], back[1])):
                 # swing around behind it, keeping our distance
                 return self._steer_to(back), 1.0
             to = unit((tr.pos[0] - pos[0], tr.pos[1] - pos[1]))
             radial = 1.0 if d > hi else (-0.6 if d < lo else 0.0)
             # follow it and stay in its rear arc
-            bv = unit((back[0] - pos[0], back[1] - pos[1]))
+            bv = unit((back[0] - pos[0], back[1] - pos[1])) if FLANK else (0.0, 0.0)
             mv = (to[0] * radial + bv[0] * 0.8, to[1] * radial + bv[1] * 0.8)
             if math.hypot(*mv) < 0.1:
                 return (0.0, 0.0), 0.0
             return unit(mv), 1.0
-        best_d = self._best_range(tr, threats)
+        best_d = self._best_range(tr, threats) * FIGHT_RANGE_SCALE
         lo, hi = best_d - 18.0, best_d + 18.0
         # weak target and we are healthy: close in to finish
         if tr.hp < 250 and self.hp > 0.5 * self.max_hp:
@@ -1278,7 +1286,7 @@ class Brain:
                     mv = self._steer_to(tr.pos) if radial >= 0 else (-to[0], -to[1])
         # several shooters: slide to a nearby spot where only our target can see us
         shooters = [e for e in threats if e["hostile"] and e["los"] and e["age"] < 2.0 and e["d"] < 230]
-        if len(shooters) >= 2:
+        if ISO and len(shooters) >= 2:
             spot = self._isolation_spot(tr, shooters)
             if spot is not None and d2(spot, pos) > 2.0:
                 sv = unit((spot[0] - pos[0], spot[1] - pos[1]))
@@ -1563,7 +1571,10 @@ class Brain:
         if self.mode == "ffa" and FFA_STYLE == "survivor" and target is not None and not target["hostile"] \
                 and self.intent != "FIGHT":
             target = None
-        if target is not None and target["age"] < 1.0:
+        npc_tgt = self._npc_shooting_us() if NPC_FIRST else None
+        if npc_tgt is not None and (target is None or not (target["hostile"] and target.get("myl", True))):
+            tgt = npc_tgt
+        elif target is not None and target["age"] < 1.0:
             tr = target["tr"]
             sc = target["scale"]
             d_ = target["d"]
@@ -1777,6 +1788,28 @@ class Brain:
             prev = (px, py, pz)
         return True
 
+    def _npc_shooting_us(self):
+        t = self.t
+        pos = self.pos
+        mh = self.stats.get("muzzle_height", 7.0)
+        muzzle = (pos[0], pos[1], pos[2] + mh)
+        best = None
+        for m in self.obs.get("mechs") or []:
+            if m.get("kind") != "npc":
+                continue
+            if t - self.npc_attackers.get(m.get("id"), -99) > 2.5:
+                continue
+            d = d2(m["pos"], pos)
+            if d > 80:
+                continue
+            c = (m["pos"][0], m["pos"][1], m["pos"][2] + 1.75)
+            if not self.los(muzzle, c):
+                continue
+            if best is None or d < best[0]:
+                best = (d, {"pos": m["pos"], "vel": m.get("vel") or [0, 0, 0], "h": 1.75, "r": 1.6,
+                            "kind": "npc", "d": d, "id": m["id"], "airborne": False})
+        return best[1] if best else None
+
     def _farm_target(self):
         pos = self.pos
         best = None
@@ -1866,6 +1899,9 @@ class Brain:
             "mortar_splash": 3 * share["mortar"], "mortar_reload": 4 * share["mortar"],
             "mortar_velocity": 2 * share["mortar"],
         }
+        if UPG_STYLE == "dps":
+            for k in ("laser_damage", "laser_charge", "gun_damage", "gun_rate", "lightning_efficiency", "lightning_range"):
+                base[k] = base.get(k, 0) * 1.8
         best_i, best_s = 0, -1e9
         for i, ch in enumerate(offer.get("choices") or []):
             cid = ch.get("id", "")
