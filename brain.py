@@ -28,7 +28,8 @@ RET_HP = 0.12
 RET_ADV = 0.3
 REGEN_HP = 0.3
 FFA_THRESHOLD = 12.0
-FFA_STYLE = os.environ.get("FFA_STYLE", "survivor")   # opportunist | survivor | aggressor
+FFA_STYLE = "survivor"
+PACIFIST = True   # opportunist | survivor | aggressor
 # free-for-all knobs (placement matters, everyone shoots)
 FFA_RET_HP = 0.4
 FFA_RET_ADV = 0.9
@@ -135,7 +136,7 @@ class Brain:
         self.cube_bad = set()
         self.cube_near = {}
         # practice squad vs free-for-all detection
-        self.mode = "practice"
+        self.mode = "ffa"
         self.ffa_evidence = 0.0
         self.ffa_log = []
         self.ffa_kinds = {}
@@ -160,6 +161,9 @@ class Brain:
         self.fight_cover = None
         self.fight_cover_t = -99.0
         self.hunt_boost = False
+        self.iso_spot = None
+        self.iso_t = -99.0
+        self.iso_for = None
         self.range_d = 90.0
         self.range_t = -99.0
         self.range_for = None
@@ -288,7 +292,7 @@ class Brain:
         # ---------------- gunnery
         aim, fire, reload = self._gunnery(target, threats)
         act["aim"] = [aim[0], aim[1]]
-        act["fire"] = fire
+        act["fire"] = [False, False] if PACIFIST else fire
         if reload:
             act["reload"] = True
         return act
@@ -794,8 +798,13 @@ class Brain:
             self.intent = "CAPTURE"
             return cap, ("fast" if d2(cap, pos) > 3.0 else "stop")
 
+        if PACIFIST and near:
+            cv = self._find_cover(near)
+            if cv is not None:
+                self.intent = "RETREAT"
+                return cv, "retreat"
         # ---- hostile engagement
-        if target is not None and target["hostile"] and (target["d"] < 230 or t - target["tr"].last_hit_us < 3):
+        if not PACIFIST and target is not None and target["hostile"] and (target["d"] < 230 or t - target["tr"].last_hit_us < 3):
             self.intent = "FIGHT"
             return None, "fight"
 
@@ -836,7 +845,7 @@ class Brain:
                 self.intent = "HUNT"
                 return None, "hunt"
             if FFA_STYLE == "survivor":
-                finish = tr.hp < 0.3 * tr.max_hp and target["d"] < 90 and hp_frac > 0.6
+                finish = (not PACIFIST) and tr.hp < 0.3 * tr.max_hp and target["d"] < 90 and hp_frac > 0.6
                 if finish:
                     self.intent = "FIGHT"
                     return None, "fight"
@@ -1267,6 +1276,14 @@ class Brain:
                 ahead = (pos[0] + mv[0] * 6, pos[1] + mv[1] * 6)
                 if not self.world.walkable(ahead[0], ahead[1]):
                     mv = self._steer_to(tr.pos) if radial >= 0 else (-to[0], -to[1])
+        # several shooters: slide to a nearby spot where only our target can see us
+        shooters = [e for e in threats if e["hostile"] and e["los"] and e["age"] < 2.0 and e["d"] < 230]
+        if len(shooters) >= 2:
+            spot = self._isolation_spot(tr, shooters)
+            if spot is not None and d2(spot, pos) > 2.0:
+                sv = unit((spot[0] - pos[0], spot[1] - pos[1]))
+                mv = (mv[0] * 0.5 + sv[0] * 1.6, mv[1] * 0.5 + sv[1] * 1.6)
+                return unit(mv), 1.0
         # stay close to cover from the other hunters while fighting this one
         others = [e for e in threats if e["hostile"] and e["tr"].id != tr.id and e["age"] < 8.0 and e["d"] < 260]
         anc = None
@@ -1302,6 +1319,55 @@ class Brain:
         if not target.get("myl", True) and d < 120 and self.hp > 0.45 * self.max_hp:
             mv = self._steer_to(tr.pos)
         return unit(mv), 1.0
+
+    def _isolation_spot(self, tr, shooters):
+        """Nearby walkable spot that keeps the target in view and hides us from the other shooters."""
+        t = self.t
+        if self.iso_spot is not None and t - self.iso_t < 0.4 and self.iso_for == tr.id:
+            return self.iso_spot
+        w = self.world
+        if w is None:
+            return None
+        pos = self.pos
+        gz0 = w.ground_z(pos[0], pos[1])
+        tp = tr.pos
+        best = None
+        tlim = min(time.perf_counter() + 0.006, self.deadline)
+        cands = [(pos[0], pos[1])]
+        for r in (8.0, 16.0):
+            for k in range(8):
+                a = k * (TAU / 8) + (0.39 if r > 10 else 0.0)
+                cands.append((pos[0] + math.cos(a) * r, pos[1] + math.sin(a) * r))
+        for (x, y) in cands:
+            if time.perf_counter() > tlim:
+                break
+            if (x, y) != (pos[0], pos[1]):
+                if not w.walkable(x, y) or not w.straight_walkable(pos[0], pos[1], x, y):
+                    continue
+                if not self.zone_ok((x, y), 1.5, 4.0):
+                    continue
+            gz = w.ground_z(x, y)
+            if abs(gz - gz0) > 3.0:
+                continue
+            body = (x, y, gz + 4.5 * self.scale)
+            head = (x, y, gz + 8.0 * self.scale)
+            exposure = 0.0
+            for e in shooters:
+                if e["tr"].id == tr.id:
+                    continue
+                sc = e["scale"]
+                ee = (e["pos"][0], e["pos"][1], e["pos"][2] + 8.0 * sc)
+                if w.los(ee[0], ee[1], ee[2], body[0], body[1], body[2]) or w.los(ee[0], ee[1], ee[2], head[0], head[1], head[2]):
+                    exposure += max(e["dps"], 20.0)
+            sees_target = w.los(head[0], head[1], gz + self.stats.get("muzzle_height", 7.0),
+                                tp[0], tp[1], tp[2] + 4.5)
+            score = exposure + (0.0 if sees_target else 60.0) + d2((x, y), pos) * 0.8
+            if best is None or score < best[0]:
+                best = (score, [x, y, gz])
+        self.iso_spot = best[1] if best else None
+        self.iso_t = t
+        self.iso_for = tr.id
+        return self.iso_spot
 
     def _best_range(self, tr, threats):
         """Distance where our expected DPS beats theirs by the widest margin."""
