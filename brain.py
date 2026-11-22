@@ -616,6 +616,12 @@ class Brain:
                 self.intent = "FIGHT"
                 return None, "fight"
 
+        # ---- supply drop being captured: hold the ring unless someone is shooting at us
+        cap = self._capturing_drop()
+        if cap is not None and not hostile_los:
+            self.intent = "CAPTURE"
+            return cap, ("fast" if d2(cap, pos) > 3.0 else "stop")
+
         # ---- hostile engagement
         if target is not None and target["hostile"] and (target["d"] < 230 or t - target["tr"].last_hit_us < 3):
             self.intent = "FIGHT"
@@ -664,6 +670,21 @@ class Brain:
             return prey["pos"], "fast"
         self.intent = "EXPLORE"
         return self._explore_goal(), "walk"
+
+    def _capturing_drop(self):
+        rad = self.c("drops.radius", 8.0)
+        for dr in self.obs.get("drops") or []:
+            dp = dr.get("pos")
+            if not dp:
+                continue
+            holder = dr.get("holder")
+            if holder is not None and holder != self.my_id:
+                continue
+            if dr.get("lands_in", 99) > 1.0:
+                continue
+            if d2(dp, self.pos) < rad + 6.0 and self.zone_ok(dp, 2.0, 4.0):
+                return [dp[0], dp[1], dp[2]]
+        return None
 
     def _cube_clusters(self):
         pts = [p for (p, ts) in self.cubes_seen.values()]
@@ -974,18 +995,26 @@ class Brain:
         held = self._held()
         their = tr.weapons
         if passive:
-            # it is not shooting back: close in where every shot lands, keep moving a little
+            # it is not shooting back: get close and behind it (rear hits deal x1.5)
             lo, hi = 12.0, 28.0 if "lightning" in held else 30.0
+            face = tr.aim[0] if tr.aim else 0.0
+            back = (tr.pos[0] - math.cos(face) * (lo + hi) * 0.5, tr.pos[1] - math.sin(face) * (lo + hi) * 0.5)
+            rel = math.atan2(pos[1] - tr.pos[1], pos[0] - tr.pos[0])
+            in_rear = abs(angn(rel - face)) > math.radians(105)
+            if d > hi + 25 or not target.get("myl", True):
+                self.hunt_boost = d > 60 and self.energy > (70 if "lightning" in held else 35)
+                goal = back if (self.world is None or self.world.walkable(back[0], back[1])) else tr.pos
+                return self._steer_to(goal), 1.0
+            if not in_rear and (self.world is None or self.world.walkable(back[0], back[1])):
+                # swing around behind it, keeping our distance
+                return self._steer_to(back), 1.0
             to = unit((tr.pos[0] - pos[0], tr.pos[1] - pos[1]))
             radial = 1.0 if d > hi else (-0.6 if d < lo else 0.0)
-            if t > self.strafe_until:
-                self.strafe_sign = -self.strafe_sign
-                self.strafe_until = t + self.rng.uniform(0.8, 1.6)
-            perp = (-to[1] * self.strafe_sign, to[0] * self.strafe_sign)
-            if d > hi + 20 or not target.get("myl", True):
-                self.hunt_boost = d > 60 and self.energy > (70 if "lightning" in held else 35)
-                return self._steer_to(tr.pos), 1.0
-            mv = (to[0] * radial + perp[0] * 0.5, to[1] * radial + perp[1] * 0.5)
+            # follow it and stay in its rear arc
+            bv = unit((back[0] - pos[0], back[1] - pos[1]))
+            mv = (to[0] * radial + bv[0] * 0.8, to[1] * radial + bv[1] * 0.8)
+            if math.hypot(*mv) < 0.1:
+                return (0.0, 0.0), 0.0
             return unit(mv), 1.0
         best_d = self._best_range(tr, threats)
         lo, hi = best_d - 18.0, best_d + 18.0
