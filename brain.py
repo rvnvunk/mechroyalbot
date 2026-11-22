@@ -33,7 +33,16 @@ FFA_STYLE = os.environ.get("FFA_STYLE", "survivor")   # opportunist | survivor |
 FFA_RET_HP = 0.4
 FFA_RET_ADV = 0.9
 FFA_REGEN_HP = 0.75
-WVAL = {"laser": 1.7, "lightning": float(os.environ.get("W_LIGHT", "1.5")), "gun": 1.0, "mortar": 0.55}
+# weapon values: gun + laser beats anything with lightning (lightning pulls us into close fights)
+WVAL = {"laser": 1.7, "lightning": float(os.environ.get("W_LIGHT", "0.9")), "gun": float(os.environ.get("W_GUN", "1.6")),
+        "mortar": float(os.environ.get("W_MORTAR", "0.55"))}
+CUBE_VAL = float(os.environ.get("CUBE_VAL", "13"))
+HOSTILE_BONUS = float(os.environ.get("HOSTILE_BONUS", "5"))
+KITE = os.environ.get("KITE", "0") == "1"
+FIGHT_BOOST = os.environ.get("FIGHT_BOOST", "0") == "1"
+STRAFE_LO = float(os.environ.get("STRAFE_LO", "0.35"))
+STRAFE_HI = float(os.environ.get("STRAFE_HI", "0.95"))
+RANGE_MIN = float(os.environ.get("RANGE_MIN", "0"))
 # experiment knobs (defaults = submitted behaviour)
 HUNT_WHEN_HOSTILE = os.environ.get("HUNT_WHEN_HOSTILE", "1") == "1"
 TRAVEL_BOOST = os.environ.get("TRAVEL_BOOST", "0") == "1"
@@ -171,6 +180,7 @@ class Brain:
         self.fight_cover = None
         self.fight_cover_t = -99.0
         self.hunt_boost = False
+        self.kite_boost = False
         self.iso_spot = None
         self.iso_t = -99.0
         self.iso_for = None
@@ -664,7 +674,7 @@ class Brain:
             if self.t - tr.last_hit_us < 3.0:
                 score += 4.0
             if tr.hostile:
-                score += 5.0
+                score += HOSTILE_BONUS
             elif d > 160:
                 score -= 4.0
             if self.mode == "ffa":
@@ -1025,7 +1035,7 @@ class Brain:
         for cp, cnt in self._cube_clusters():
             if abs(cp[2] - pos[2]) > 6 and d2(cp, pos) < 8:
                 continue
-            per = 13.0 if self.my_cubes < 10 else 6.0
+            per = CUBE_VAL if self.my_cubes < 10 else CUBE_VAL * 0.46
             consider(cp, per * min(cnt, 4) ** 0.85, "cube")
         if not danger or hp_frac > 0.7:
             for nid, (p, v, hp, ts) in self.npcs.items():
@@ -1182,8 +1192,13 @@ class Brain:
 
         if style in ("fight", "hunt") and target is not None:
             self.hunt_boost = False
+            self.kite_boost = False
             mv, speed = self._fight_move(target, threats, passive=(style == "hunt"))
-            boost = self.hunt_boost
+            boost = self.hunt_boost or self.kite_boost
+            if FIGHT_BOOST and style == "fight" and not has_light and self.energy > 40:
+                charging = any(w and w.get("kind") == "laser" and (w.get("charge") or 0) > 0 for w in self.weapons)
+                if not charging and any(e["hostile"] and e["los"] for e in threats):
+                    boost = True
         elif style == "stop":
             mv, speed = (0.0, 0.0), 0.0
         elif style == "retreat" and goal is not None:
@@ -1259,6 +1274,8 @@ class Brain:
                 return (0.0, 0.0), 0.0
             return unit(mv), 1.0
         best_d = self._best_range(tr, threats) * FIGHT_RANGE_SCALE
+        if RANGE_MIN > 0 and "lightning" not in held and not ("lightning" in their):
+            best_d = max(best_d, RANGE_MIN)
         lo, hi = best_d - 18.0, best_d + 18.0
         # weak target and we are healthy: close in to finish
         if tr.hp < 250 and self.hp > 0.5 * self.max_hp:
@@ -1269,9 +1286,20 @@ class Brain:
             radial = 1.0
         elif d < lo:
             radial = -1.0
+        self.kite_boost = False
+        if KITE and d < lo - 5 and "lightning" not in held:
+            hs = [e for e in threats if e["hostile"] and e["age"] < 4.0 and e["d"] < 250]
+            if hs:
+                cx = sum(e["pos"][0] for e in hs) / len(hs)
+                cy = sum(e["pos"][1] for e in hs) / len(hs)
+                away = unit((pos[0] - cx, pos[1] - cy))
+                if self.world is None or self.world.walkable(pos[0] + away[0] * 8, pos[1] + away[1] * 8):
+                    to = (-away[0], -away[1])
+                if self.energy > 30:
+                    self.kite_boost = True
         if t > self.strafe_until:
             self.strafe_sign = -self.strafe_sign if self.rng.random() < 0.75 else self.strafe_sign
-            self.strafe_until = t + self.rng.uniform(0.35, 0.95)
+            self.strafe_until = t + self.rng.uniform(STRAFE_LO, STRAFE_HI)
         perp = (-to[1] * self.strafe_sign, to[0] * self.strafe_sign)
         mv = (to[0] * radial * 1.0 + perp[0] * 0.9, to[1] * radial * 1.0 + perp[1] * 0.9)
         # walls: if the strafe direction is blocked, flip
